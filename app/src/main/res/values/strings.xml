@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BT Speaker Keeper</string>
+    <string name="accessibility_service_label">BT Speaker Keeper Automation</string>
+    <string name="accessibility_service_description">Automates Google TV Bluetooth settings to reconnect your selected paired speaker when needed.</string>
+</resources>

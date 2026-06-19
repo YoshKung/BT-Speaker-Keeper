@@ -1,16 +1,16 @@
 package com.btspeakerkeeper.tv.accessibility
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
-import android.graphics.Path
-import android.graphics.Rect
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.btspeakerkeeper.tv.PairingAssistActivity
 import com.btspeakerkeeper.tv.bluetooth.BluetoothStateRepository
+import com.btspeakerkeeper.tv.core.AutomationSafetyPolicy
 import com.btspeakerkeeper.tv.core.AutomationTextMatcher
 import com.btspeakerkeeper.tv.core.AutomationMode
 import com.btspeakerkeeper.tv.core.LivePairPromptGuard
@@ -173,7 +173,15 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         currentSession = session
 
         if (!isAutomationWindowPackage(root.packageName)) {
+            logDebug(session, "waiting for automation package=${root.packageName}")
             retryOrFinish(session, "Waiting for Google TV Settings window")
+            return
+        }
+
+        val unsafeReason = AutomationSafetyPolicy.unsafeAutomationWindowReason(windowText(root))
+        if (unsafeReason != null) {
+            logDebug(session, unsafeReason)
+            retryOrFinish(session, unsafeReason)
             return
         }
 
@@ -192,22 +200,23 @@ class BtKeeperAccessibilityService : AccessibilityService() {
 
     private fun processConnect(root: AccessibilityNodeInfo, session: RuntimeSession) {
         if (!session.targetClicked) {
-            val targetNode = findFirstNode(root) { node ->
-                TargetDeviceMatcher.matchesText(nodeText(node), session.targetName, session.targetAddress)
-            }
-            if (targetNode != null && clickNodeOrAncestor(targetNode)) {
+            val targetNode = findTargetTextNode(root, session)
+            if (targetNode != null && safeClickClickableNode(targetNode, session, "target speaker row")) {
                 currentSession = session.copy(targetClicked = true)
                 scheduleProcess(1_500L)
                 return
             }
         }
 
-        val connectNode = findFirstNode(root) { node ->
-            AutomationTextMatcher.isConnectAction(nodeText(node))
-        }
-        if (connectNode != null && clickNodeOrAncestor(connectNode)) {
+        val connectNode = findConnectNodeInsideTargetContext(root, session)
+        if (connectNode != null && safeClickClickableNode(connectNode, session, "Connect action")) {
             currentSession = session.copy(targetClicked = true)
             scheduleProcess(2_000L)
+            return
+        }
+
+        if (session.targetClicked) {
+            retryOrFinish(session, "Connect skipped: no target context")
             return
         }
 
@@ -215,7 +224,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             val navigationNode = findFirstNode(root) { node ->
                 AutomationTextMatcher.isDeviceListNavigation(nodeText(node))
             }
-            if (navigationNode != null && clickNodeOrAncestor(navigationNode)) {
+            if (navigationNode != null && safeClickClickableNode(navigationNode, session, "device list navigation")) {
                 currentSession = session.copy(navigationClicked = true)
                 scheduleProcess(1_500L)
                 return
@@ -244,7 +253,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             TargetDeviceMatcher.matchesText(nodeText(node), session.targetName, session.targetAddress)
         }
         val clickableTargetNode = targetNode?.let { clickableNodeOrAncestor(it) }
-        if (clickableTargetNode != null && clickNode(clickableTargetNode)) {
+        if (clickableTargetNode != null && safeClickClickableNode(clickableTargetNode, session, "repair target device")) {
             val selectedText = subtreeText(clickableTargetNode)
             val discoveredAddress = rememberDiscoveredAddress(selectedText, session.targetAddress)
             currentSession = session.copy(
@@ -259,7 +268,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
 
         if (session.allowSingleVisibleDeviceRepair) {
             val visibleDeviceNode = findSingleVisibleRepairDevice(root)
-            if (visibleDeviceNode != null && clickNode(visibleDeviceNode.node)) {
+            if (visibleDeviceNode != null && safeClickClickableNode(visibleDeviceNode.node, session, "single visible repair device")) {
                 val discoveredAddress = rememberDiscoveredAddress(visibleDeviceNode.text, session.targetAddress)
                 currentSession = session.copy(
                     targetClicked = true,
@@ -271,7 +280,9 @@ class BtKeeperAccessibilityService : AccessibilityService() {
                 )
                 prefs.recordState(
                     SpeakerConnectionState.AUTOMATION_STARTED,
-                    "Repair pairing: selected only visible device ${visibleDeviceNode.displayName}",
+                    "Repair pairing: selected only visible device ${
+                        AutomationSafetyPolicy.shortDiagnosticText(visibleDeviceNode.displayName)
+                    }",
                 )
                 scheduleProcess(2_000L)
                 return
@@ -282,7 +293,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             val pairNavigationNode = findFirstNode(root) { node ->
                 AutomationTextMatcher.isRepairPairNavigation(nodeText(node))
             }
-            if (pairNavigationNode != null && clickNodeOrAncestor(pairNavigationNode)) {
+            if (pairNavigationNode != null && safeClickClickableNode(pairNavigationNode, session, "repair pair navigation")) {
                 currentSession = session.copy(navigationClicked = true)
                 prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, "Repair pairing: opened pair flow")
                 scheduleProcess(2_000L)
@@ -323,7 +334,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             return false
         }
 
-        if (!clickNodeOrAncestor(pairNode)) {
+        if (!safeClickClickableNode(pairNode, session, "Bluetooth pair prompt")) {
             return false
         }
 
@@ -365,46 +376,30 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         root: AccessibilityNodeInfo,
         targetName: String,
         targetAddress: String,
-        targetClicked: Boolean,
+        @Suppress("UNUSED_PARAMETER") targetClicked: Boolean,
     ): Boolean {
-        val targetNode = findFirstNode(root) { node ->
-            TargetDeviceMatcher.matchesText(nodeText(node), targetName, targetAddress)
+        val connectedNode = findFirstNode(root) { node ->
+            AutomationTextMatcher.containsConnectedState(nodeText(node))
         }
-        if (targetNode != null) {
-            var node: AccessibilityNodeInfo? = targetNode
-            repeat(MAX_PARENT_SEARCH_DEPTH) {
-                val current = node ?: return@repeat
-                if (subtreeContainsConnectedState(current)) {
-                    return true
-                }
-                node = current.parent
-            }
-        }
-        return targetClicked && subtreeContainsConnectedState(root)
+        return connectedNode != null &&
+            hasTargetConnectedContextInAncestors(connectedNode, root, targetName, targetAddress)
     }
 
     private fun retryOrFinish(session: RuntimeSession, message: String) {
+        val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
         val nextRetryCount = session.retryCount + 1
+        logDebug(session, "retry $nextRetryCount/${session.maxRetries}: $safeMessage")
         if (nextRetryCount >= session.maxRetries) {
             if (session.mode == AutomationMode.PAIR_REPAIR) {
-                finishPairRepairNeedsUser(message)
+                finishPairRepairNeedsUser(safeMessage)
                 return
             }
-            finishFailure(message)
+            finishFailure(safeMessage)
             return
         }
+        prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, safeMessage)
         currentSession = session.copy(retryCount = nextRetryCount)
         scheduleProcess(1_500L)
-    }
-
-    private fun subtreeContainsConnectedState(root: AccessibilityNodeInfo): Boolean {
-        var connectedVisible = false
-        traverse(root) { node ->
-            if (AutomationTextMatcher.containsConnectedState(nodeText(node))) {
-                connectedVisible = true
-            }
-        }
-        return connectedVisible
     }
 
     private fun subtreeContainsPairingNotReadyState(root: AccessibilityNodeInfo): Boolean {
@@ -492,13 +487,96 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         return builder.toString()
     }
 
-    private fun clickNodeOrAncestor(startNode: AccessibilityNodeInfo): Boolean {
-        val clickableNode = clickableNodeOrAncestor(startNode) ?: startNode
-        return clickNode(clickableNode)
+    private fun findTargetTextNode(root: AccessibilityNodeInfo, session: RuntimeSession): AccessibilityNodeInfo? {
+        return findFirstNode(root) { node ->
+            AutomationSafetyPolicy.hasTargetContext(
+                contextText = nodeText(node),
+                targetName = session.targetName,
+                targetAddress = session.targetAddress,
+            )
+        }
     }
 
-    private fun clickNode(node: AccessibilityNodeInfo): Boolean {
-        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK) || clickNodeCenter(node)
+    private fun findConnectNodeInsideTargetContext(
+        root: AccessibilityNodeInfo,
+        session: RuntimeSession,
+    ): AccessibilityNodeInfo? {
+        return findFirstNode(root) { node ->
+            AutomationTextMatcher.isConnectAction(nodeText(node)) &&
+                hasTargetContextInAncestors(node, root, session)
+        }
+    }
+
+    private fun hasTargetContextInAncestors(
+        startNode: AccessibilityNodeInfo,
+        root: AccessibilityNodeInfo,
+        session: RuntimeSession,
+    ): Boolean {
+        var node: AccessibilityNodeInfo? = startNode
+        repeat(MAX_PARENT_SEARCH_DEPTH) {
+            val current = node ?: return false
+            if (current == root) {
+                return false
+            }
+            if (
+                AutomationSafetyPolicy.hasTargetContext(
+                    contextText = subtreeText(current),
+                    targetName = session.targetName,
+                    targetAddress = session.targetAddress,
+                )
+            ) {
+                return true
+            }
+            node = current.parent
+        }
+        return false
+    }
+
+    private fun hasTargetConnectedContextInAncestors(
+        startNode: AccessibilityNodeInfo,
+        root: AccessibilityNodeInfo,
+        targetName: String,
+        targetAddress: String,
+    ): Boolean {
+        var node: AccessibilityNodeInfo? = startNode
+        repeat(MAX_PARENT_SEARCH_DEPTH) {
+            val current = node ?: return false
+            if (current == root) {
+                return false
+            }
+            if (
+                AutomationSafetyPolicy.isTargetConnectedContext(
+                    contextText = subtreeText(current),
+                    targetName = targetName,
+                    targetAddress = targetAddress,
+                )
+            ) {
+                return true
+            }
+            node = current.parent
+        }
+        return false
+    }
+
+    private fun safeClickClickableNode(
+        startNode: AccessibilityNodeInfo,
+        session: RuntimeSession?,
+        actionName: String,
+    ): Boolean {
+        val clickableNode = clickableNodeOrAncestor(startNode)
+        if (clickableNode == null) {
+            logDebug(session, "click rejected: no clickable node for $actionName", nodeText(startNode))
+            return false
+        }
+
+        val clicked = clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        val clickedText = subtreeText(clickableNode).ifBlank { nodeText(clickableNode) }
+        if (clicked) {
+            logDebug(session, "clicked $actionName", clickedText)
+        } else {
+            logDebug(session, "click failed: $actionName", clickedText)
+        }
+        return clicked
     }
 
     private fun clickableNodeOrAncestor(startNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -511,21 +589,6 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             node = current.parent
         }
         return null
-    }
-
-    private fun clickNodeCenter(node: AccessibilityNodeInfo): Boolean {
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        if (bounds.isEmpty) {
-            return false
-        }
-        val path = Path().apply {
-            moveTo(bounds.centerX().toFloat(), bounds.centerY().toFloat())
-        }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, 80L))
-            .build()
-        return dispatchGesture(gesture, null, null)
     }
 
     private fun scrollForward(root: AccessibilityNodeInfo): Boolean {
@@ -560,10 +623,8 @@ class BtKeeperAccessibilityService : AccessibilityService() {
                 return@traverse
             }
             val text = subtreeText(node)
-            if (text.isBlank() || AutomationTextMatcher.containsPairingPromptExclusion(text)) {
-                return@traverse
-            }
-            if (AutomationTextMatcher.isRepairPairNavigation(text) || AutomationTextMatcher.isPairAction(text)) {
+            if (AutomationSafetyPolicy.isUnsafeSingleVisibleRepairCandidate(text)) {
+                logDebug(null, "single visible repair candidate rejected", text)
                 return@traverse
             }
             candidates.add(
@@ -594,6 +655,33 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private fun isAutomationWindowPackage(packageName: CharSequence?): Boolean {
         val normalizedPackage = packageName?.toString()?.trim().orEmpty()
         return normalizedPackage in automationWindowPackages
+    }
+
+    private fun logDebug(
+        session: RuntimeSession?,
+        message: String,
+        nodeText: String? = null,
+    ) {
+        if (!isDebuggableBuild()) {
+            return
+        }
+
+        val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
+        val sessionText = if (session == null) {
+            "session=none"
+        } else {
+            "session=${session.id} mode=${session.mode} retry=${session.retryCount}/${session.maxRetries}"
+        }
+        val nodeSuffix = nodeText
+            ?.let { AutomationSafetyPolicy.shortDiagnosticText(it) }
+            ?.takeIf { it.isNotBlank() }
+            ?.let { " node=\"$it\"" }
+            .orEmpty()
+        Log.d(TAG, "$sessionText $safeMessage$nodeSuffix")
+    }
+
+    private fun isDebuggableBuild(): Boolean {
+        return (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     }
 
     private fun AutomationSession.toRuntimeSession(): RuntimeSession {
@@ -627,6 +715,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     )
 
     companion object {
+        private const val TAG = "BtKeeperAutomation"
         private const val MAX_PARENT_SEARCH_DEPTH = 8
         private const val CONNECTION_MONITOR_INTERVAL_MILLIS = 5_000L
         private const val MONITOR_CHECK_TIMEOUT_MILLIS = 4_000L

@@ -60,6 +60,21 @@ object AutomationTextMatcher {
         "จับคู่รีโมตหรืออุปกรณ์เสริม",
         "จับคู่รีโมทหรืออุปกรณ์เสริม",
     )
+    private val genericSettingsRows = setOf(
+        "Connected devices",
+        "Available devices",
+        "Other devices",
+        "Searching for accessories",
+        "Searching for devices",
+        "Device name",
+        "Settings",
+        "อุปกรณ์ที่เชื่อมต่อ",
+        "อุปกรณ์ที่พร้อมใช้งาน",
+        "อุปกรณ์อื่น",
+        "กำลังค้นหาอุปกรณ์",
+        "ชื่ออุปกรณ์",
+        "การตั้งค่า",
+    )
 
     fun normalize(value: CharSequence?): String {
         return SpeakerNameMatcher.normalizeName(value)
@@ -104,5 +119,12 @@ object AutomationTextMatcher {
     fun containsPairingPromptExclusion(value: CharSequence?): Boolean {
         val normalized = normalize(value)
         return pairingPromptExclusions.any { exclusion -> normalized.contains(exclusion) }
+    }
+
+    fun isGenericSettingsRow(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        return genericSettingsRows.any { text ->
+            normalized == text || normalized.contains(text)
+        }
     }
 }

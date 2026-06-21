@@ -18,8 +18,10 @@ import com.btspeakerkeeper.tv.core.SpeakerConnectionState
 import com.btspeakerkeeper.tv.core.SpeakerNameMatcher
 import com.btspeakerkeeper.tv.core.TargetDeviceMatcher
 import com.btspeakerkeeper.tv.core.TriggerSource
+import com.btspeakerkeeper.tv.core.AutomationWindowKind
 import com.btspeakerkeeper.tv.control.PlaybackDetector
 import com.btspeakerkeeper.tv.control.ReconnectCoordinator
+import com.btspeakerkeeper.tv.control.SettingsLauncher
 import com.btspeakerkeeper.tv.data.AppPrefs
 import com.btspeakerkeeper.tv.data.AutomationSession
 
@@ -178,11 +180,29 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             return
         }
 
-        val unsafeReason = AutomationSafetyPolicy.unsafeAutomationWindowReason(windowText(root))
-        if (unsafeReason != null) {
-            logDebug(session, unsafeReason)
-            retryOrFinish(session, unsafeReason)
-            return
+        val visibleWindowText = windowText(root)
+        val windowClassification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = visibleWindowText,
+            mode = session.mode,
+            targetName = session.targetName,
+            targetAddress = session.targetAddress,
+        )
+        when (windowClassification.kind) {
+            AutomationWindowKind.UNSAFE -> {
+                val reason = windowClassification.reason ?: "Unsafe automation window"
+                logDebug(session, reason)
+                finishFailure(reason)
+                return
+            }
+
+            AutomationWindowKind.WRONG_DESTINATION -> {
+                handleWrongDestination(session, windowClassification.reason ?: "Wrong Settings destination")
+                return
+            }
+
+            AutomationWindowKind.TARGET_CONTEXT,
+            AutomationWindowKind.ALLOWED_NAVIGATION,
+            AutomationWindowKind.NEUTRAL -> Unit
         }
 
         if (isTargetConnectedVisible(root, session.targetName, session.targetAddress, session.targetClicked)) {
@@ -231,7 +251,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (scrollForward(root)) {
+        if (canScrollWindow(root, session) && scrollForward(root)) {
             retryOrFinish(session, "Scrolled while searching for target speaker or Connect button")
             return
         }
@@ -301,7 +321,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (scrollForward(root)) {
+        if (canScrollWindow(root, session) && scrollForward(root)) {
             retryOrFinish(session, "Repair pairing: scrolled while searching for ${session.targetName}")
             return
         }
@@ -399,6 +419,25 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         }
         prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, safeMessage)
         currentSession = session.copy(retryCount = nextRetryCount)
+        scheduleProcess(1_500L)
+    }
+
+    private fun handleWrongDestination(session: RuntimeSession, message: String) {
+        val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
+        if (session.wrongDestinationRecoveryAttempted) {
+            logDebug(session, "wrong destination recovery failed: $safeMessage")
+            finishFailure(safeMessage)
+            return
+        }
+
+        val recoveryMessage = "$safeMessage; reopening fresh Settings home"
+        logDebug(session, recoveryMessage)
+        prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, recoveryMessage)
+        currentSession = session.copy(
+            wrongDestinationRecoveryAttempted = true,
+            navigationClicked = false,
+        )
+        SettingsLauncher.openFreshSettingsHome(this)
         scheduleProcess(1_500L)
     }
 
@@ -596,6 +635,15 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         return scrollable?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true
     }
 
+    private fun canScrollWindow(root: AccessibilityNodeInfo, session: RuntimeSession): Boolean {
+        return AutomationSafetyPolicy.canScrollAutomationWindow(
+            windowText = windowText(root),
+            mode = session.mode,
+            targetName = session.targetName,
+            targetAddress = session.targetAddress,
+        )
+    }
+
     private fun repairDeviceNameFromNodeText(text: String, targetAddress: String): String {
         val normalizedText = SpeakerNameMatcher.normalizeName(text)
         val normalizedAddress = TargetDeviceMatcher.normalizeAddress(targetAddress)
@@ -711,6 +759,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val retryCount: Int = 0,
         val targetClicked: Boolean = false,
         val navigationClicked: Boolean = false,
+        val wrongDestinationRecoveryAttempted: Boolean = false,
         val repairDeviceName: String = "",
     )
 

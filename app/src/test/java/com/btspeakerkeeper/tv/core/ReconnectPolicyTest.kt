@@ -7,7 +7,7 @@ import org.junit.Test
 class ReconnectPolicyTest {
     private val policy = ReconnectPolicy()
     private val settings = ReconnectSettings(
-        targetDeviceName = "Demo Speaker Speaker",
+        targetDeviceName = "Demo Speaker",
         autoConnectEnabled = true,
         skipWhilePlaybackActive = true,
         maxRetryCount = 3,

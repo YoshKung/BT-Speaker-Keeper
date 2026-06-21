@@ -38,6 +38,12 @@ class AutomationTextMatcherTest {
     }
 
     @Test
+    fun doesNotTreatPairAccessoryAsDeviceListNavigation() {
+        assertFalse(AutomationTextMatcher.isDeviceListNavigation("Pair accessory"))
+        assertFalse(AutomationTextMatcher.isDeviceListNavigation("จับคู่อุปกรณ์เสริม"))
+    }
+
+    @Test
     fun recognizesEnglishAndThaiPairActions() {
         assertTrue(AutomationTextMatcher.isPairAction("Pair"))
         assertTrue(AutomationTextMatcher.isPairAction("Pair device"))
@@ -54,7 +60,7 @@ class AutomationTextMatcherTest {
 
     @Test
     fun recognizesWifiAndAdbPairingExclusions() {
-        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("รหัสการจับคู่ Wi-Fi 123456"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("รหัสการจับคู่ Wi-Fi 329545"))
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("รหัสการจับคู่ Wi‑Fi 123456"))
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("IP address and port 192.0.2.10:46353"))
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("Wireless debugging"))
@@ -66,6 +72,19 @@ class AutomationTextMatcherTest {
         assertTrue(AutomationTextMatcher.isRepairPairNavigation("Pair accessory"))
         assertTrue(AutomationTextMatcher.isRepairPairNavigation("จับคู่อุปกรณ์"))
         assertTrue(AutomationTextMatcher.isRepairPairNavigation("จับคู่รีโมตหรืออุปกรณ์เสริม"))
+    }
+
+    @Test
+    fun recognizesWrongSettingsDestinations() {
+        assertTrue(AutomationTextMatcher.isWrongSettingsDestination("Security Play Protect Permissions"))
+        assertTrue(AutomationTextMatcher.isWrongSettingsDestination("ความปลอดภัย สแกนแอปด้วย Play Protect สิทธิ์ของแอป"))
+        assertTrue(AutomationTextMatcher.isWrongSettingsDestination("Developer options USB debugging"))
+    }
+
+    @Test
+    fun doesNotTreatBareAppsCategoryAsWrongDestination() {
+        assertFalse(AutomationTextMatcher.isWrongSettingsDestination("Apps"))
+        assertFalse(AutomationTextMatcher.isWrongSettingsDestination("แอป"))
     }
 
     @Test

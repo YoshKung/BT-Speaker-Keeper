@@ -75,6 +75,33 @@ object AutomationTextMatcher {
         "ชื่ออุปกรณ์",
         "การตั้งค่า",
     )
+    private val wrongSettingsDestinationTexts = setOf(
+        "Security",
+        "Play Protect",
+        "Scan apps with Play Protect",
+        "Improve harmful app detection",
+        "Permissions",
+        "App permissions",
+        "Special app access",
+        "Manage updates",
+        "Unused apps",
+        "Developer options",
+        "USB debugging",
+        "Bug report",
+        "Stay awake",
+        "ความปลอดภัย",
+        "สแกนแอปด้วย Play Protect",
+        "ปรับปรุงการตรวจหาแอปอันตราย",
+        "สิทธิ์",
+        "สิทธิ์ของแอป",
+        "สิทธิ์เข้าถึงพิเศษของแอป",
+        "จัดการการอัปเดต",
+        "แอปที่ไม่ได้ใช้",
+        "ตัวเลือกสำหรับนักพัฒนา",
+        "การแก้ไขข้อบกพร่อง USB",
+        "รายงานข้อบกพร่อง",
+        "เปิดหน้าจอค้างไว้",
+    )
 
     fun normalize(value: CharSequence?): String {
         return SpeakerNameMatcher.normalizeName(value)
@@ -104,6 +131,12 @@ object AutomationTextMatcher {
 
     fun isDeviceListNavigation(value: CharSequence?): Boolean {
         val normalized = normalize(value)
+        if (
+            pairActions.any { action -> normalized == action } ||
+            repairPairNavigationTexts.any { text -> normalized == text || normalized.contains(text) }
+        ) {
+            return false
+        }
         return deviceListNavigationTexts.any { text ->
             normalized == text || normalized.contains(text)
         }
@@ -124,6 +157,13 @@ object AutomationTextMatcher {
     fun isGenericSettingsRow(value: CharSequence?): Boolean {
         val normalized = normalize(value)
         return genericSettingsRows.any { text ->
+            normalized == text || normalized.contains(text)
+        }
+    }
+
+    fun isWrongSettingsDestination(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        return wrongSettingsDestinationTexts.any { text ->
             normalized == text || normalized.contains(text)
         }
     }

@@ -88,7 +88,7 @@ object ReconnectCoordinator {
                                 if (automationMode == AutomationMode.PAIR_REPAIR) {
                                     SettingsLauncher.openPairAccessorySettings(appContext)
                                 } else {
-                                    SettingsLauncher.openBluetoothSettings(appContext)
+                                    SettingsLauncher.openConnectSettings(appContext)
                                 }
                             }
 

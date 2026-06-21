@@ -1,5 +1,18 @@
 package com.btspeakerkeeper.tv.core
 
+enum class AutomationWindowKind {
+    UNSAFE,
+    TARGET_CONTEXT,
+    ALLOWED_NAVIGATION,
+    WRONG_DESTINATION,
+    NEUTRAL,
+}
+
+data class AutomationWindowClassification(
+    val kind: AutomationWindowKind,
+    val reason: String? = null,
+)
+
 object AutomationSafetyPolicy {
     private val bluetoothAddressPattern = Regex("(?i)([0-9A-F]{2}:){5}[0-9A-F]{2}")
     private val pairingCodePattern = Regex(
@@ -13,6 +26,34 @@ object AutomationSafetyPolicy {
         } else {
             null
         }
+    }
+
+    fun classifyAutomationWindow(
+        windowText: CharSequence?,
+        mode: AutomationMode,
+        targetName: CharSequence?,
+        targetAddress: CharSequence?,
+    ): AutomationWindowClassification {
+        unsafeAutomationWindowReason(windowText)?.let { reason ->
+            return AutomationWindowClassification(AutomationWindowKind.UNSAFE, reason)
+        }
+
+        if (hasTargetContext(windowText, targetName, targetAddress)) {
+            return AutomationWindowClassification(AutomationWindowKind.TARGET_CONTEXT)
+        }
+
+        if (hasAllowedAutomationNavigation(windowText, mode)) {
+            return AutomationWindowClassification(AutomationWindowKind.ALLOWED_NAVIGATION)
+        }
+
+        if (AutomationTextMatcher.isWrongSettingsDestination(windowText)) {
+            return AutomationWindowClassification(
+                AutomationWindowKind.WRONG_DESTINATION,
+                wrongSettingsDestinationReason(windowText),
+            )
+        }
+
+        return AutomationWindowClassification(AutomationWindowKind.NEUTRAL)
     }
 
     fun hasTargetContext(
@@ -36,10 +77,22 @@ object AutomationSafetyPolicy {
         val normalized = AutomationTextMatcher.normalize(text)
         return normalized.isBlank() ||
             AutomationTextMatcher.containsPairingPromptExclusion(normalized) ||
+            AutomationTextMatcher.isWrongSettingsDestination(normalized) ||
             AutomationTextMatcher.isRepairPairNavigation(normalized) ||
             AutomationTextMatcher.isPairAction(normalized) ||
             AutomationTextMatcher.isDeviceListNavigation(normalized) ||
             AutomationTextMatcher.isGenericSettingsRow(normalized)
+    }
+
+    fun canScrollAutomationWindow(
+        windowText: CharSequence?,
+        mode: AutomationMode,
+        targetName: CharSequence?,
+        targetAddress: CharSequence?,
+    ): Boolean {
+        val classification = classifyAutomationWindow(windowText, mode, targetName, targetAddress)
+        return classification.kind == AutomationWindowKind.TARGET_CONTEXT ||
+            classification.kind == AutomationWindowKind.ALLOWED_NAVIGATION
     }
 
     fun shortDiagnosticText(value: CharSequence?, maxLength: Int = DEFAULT_DIAGNOSTIC_TEXT_LENGTH): String {
@@ -72,6 +125,31 @@ object AutomationSafetyPolicy {
             return "<REDACTED_ADDRESS>"
         }
         return listOf("**", "**", "**", "**", parts[4], parts[5]).joinToString(":")
+    }
+
+    private fun hasAllowedAutomationNavigation(
+        windowText: CharSequence?,
+        mode: AutomationMode,
+    ): Boolean {
+        return AutomationTextMatcher.isDeviceListNavigation(windowText) ||
+            (mode == AutomationMode.PAIR_REPAIR && AutomationTextMatcher.isRepairPairNavigation(windowText))
+    }
+
+    private fun wrongSettingsDestinationReason(windowText: CharSequence?): String {
+        val normalized = AutomationTextMatcher.normalize(windowText)
+        return when {
+            normalized.contains("Developer options") ||
+                normalized.contains("ตัวเลือกสำหรับนักพัฒนา") ->
+                "Wrong Settings destination: Developer options"
+
+            normalized.contains("Play Protect") ||
+                normalized.contains("Security") ||
+                normalized.contains("ความปลอดภัย") ||
+                normalized.contains("สิทธิ์") ->
+                "Wrong Settings destination: Apps/Security"
+
+            else -> "Wrong Settings destination"
+        }
     }
 
     private const val BLUETOOTH_ADDRESS_PART_COUNT = 6

@@ -10,15 +10,18 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.btspeakerkeeper.tv.PairingAssistActivity
 import com.btspeakerkeeper.tv.bluetooth.BluetoothStateRepository
-import com.btspeakerkeeper.tv.core.AutomationSafetyPolicy
-import com.btspeakerkeeper.tv.core.AutomationTextMatcher
 import com.btspeakerkeeper.tv.core.AutomationMode
+import com.btspeakerkeeper.tv.core.AutomationSafetyPolicy
+import com.btspeakerkeeper.tv.core.AutomationSessionGuards
+import com.btspeakerkeeper.tv.core.AutomationTextMatcher
+import com.btspeakerkeeper.tv.core.AutomationWindowKind
+import com.btspeakerkeeper.tv.core.ConnectProgressRecoveryAction
+import com.btspeakerkeeper.tv.core.ConnectProgressRecoveryPolicy
 import com.btspeakerkeeper.tv.core.LivePairPromptGuard
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
 import com.btspeakerkeeper.tv.core.SpeakerNameMatcher
 import com.btspeakerkeeper.tv.core.TargetDeviceMatcher
 import com.btspeakerkeeper.tv.core.TriggerSource
-import com.btspeakerkeeper.tv.core.AutomationWindowKind
 import com.btspeakerkeeper.tv.control.PlaybackDetector
 import com.btspeakerkeeper.tv.control.ReconnectCoordinator
 import com.btspeakerkeeper.tv.control.SettingsLauncher
@@ -33,6 +36,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private var monitorScheduled = false
     private var monitorCheckInProgress = false
     private var monitorCheckToken = 0
+    private var connectedConfirmationSessionId: Long? = null
     private var lastMonitorReconnectAtMillis = 0L
     private var lastLivePairAcceptedAtMillis: Long? = null
 
@@ -187,6 +191,11 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             targetName = session.targetName,
             targetAddress = session.targetAddress,
         )
+        logDebug(
+            session,
+            "window package=${root.packageName} kind=${windowClassification.kind}",
+            focusedNodeText(root),
+        )
         when (windowClassification.kind) {
             AutomationWindowKind.UNSAFE -> {
                 val reason = windowClassification.reason ?: "Unsafe automation window"
@@ -202,11 +211,12 @@ class BtKeeperAccessibilityService : AccessibilityService() {
 
             AutomationWindowKind.TARGET_CONTEXT,
             AutomationWindowKind.ALLOWED_NAVIGATION,
+            AutomationWindowKind.SETTINGS_HOME,
             AutomationWindowKind.NEUTRAL -> Unit
         }
 
         if (isTargetConnectedVisible(root, session.targetName, session.targetAddress, session.targetClicked)) {
-            finishSuccess()
+            confirmTargetConnectedWithA2dp(session)
             return
         }
 
@@ -219,41 +229,91 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun processConnect(root: AccessibilityNodeInfo, session: RuntimeSession) {
-        if (!session.targetClicked) {
-            val targetNode = findTargetTextNode(root, session)
-            if (targetNode != null && safeClickClickableNode(targetNode, session, "target speaker row")) {
-                currentSession = session.copy(targetClicked = true)
-                scheduleProcess(1_500L)
-                return
-            }
-        }
-
         val connectNode = findConnectNodeInsideTargetContext(root, session)
-        if (connectNode != null && safeClickClickableNode(connectNode, session, "Connect action")) {
-            currentSession = session.copy(targetClicked = true)
-            scheduleProcess(2_000L)
+        if (connectNode != null && safeClickClickableNode(connectNode, session, "Connect in saved-device target context")) {
+            currentSession = session.copy(
+                targetClicked = true,
+                targetClickCheckStartedAtMillis = System.currentTimeMillis(),
+            )
+            scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
             return
         }
 
+        if (!session.targetClicked) {
+            val targetNode = findTargetTextNode(root, session)
+            if (targetNode != null) {
+                if (safeClickClickableNode(targetNode, session, "target speaker row")) {
+                    currentSession = session.copy(
+                        targetClicked = true,
+                        targetClickCheckStartedAtMillis = System.currentTimeMillis(),
+                    )
+                    scheduleProcess(POST_TARGET_CLICK_CHECK_DELAY_MILLIS)
+                    return
+                }
+                logDebug(session, "target text node skipped: not clickable; searching Connect action", nodeText(targetNode))
+            }
+        }
+
         if (session.targetClicked) {
-            retryOrFinish(session, "Connect skipped: no target context")
+            val connectNodeAfterTargetClick = findConnectNodeAfterTargetClick(root)
+            if (
+                connectNodeAfterTargetClick != null &&
+                safeClickClickableNode(connectNodeAfterTargetClick, session, "Connect action after target row")
+            ) {
+                scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
+                return
+            }
+
+            confirmTargetConnectedWithA2dp(session, "Target row click not confirmed by A2DP")
             return
         }
 
         if (!session.navigationClicked) {
             val navigationNode = findFirstNode(root) { node ->
-                AutomationTextMatcher.isDeviceListNavigation(nodeText(node))
+                AutomationTextMatcher.isDeviceListNavigationTarget(nodeText(node))
             }
-            if (navigationNode != null && safeClickClickableNode(navigationNode, session, "device list navigation")) {
-                currentSession = session.copy(navigationClicked = true)
-                scheduleProcess(1_500L)
-                return
+            if (navigationNode != null) {
+                if (session.navigationScrollCount >= MAX_NAVIGATION_SCROLL_ATTEMPTS) {
+                    retryOrFinish(session, "Navigation skipped: device list route not focused")
+                    return
+                }
+                when (safeFocusOrClickNavigationNode(navigationNode, session, "device list navigation")) {
+                    NavigationActionResult.CLICKED -> {
+                        currentSession = session.copy(
+                            navigationClicked = true,
+                            navigationScrollCount = 0,
+                        )
+                        scheduleProcess(1_500L)
+                        return
+                    }
+
+                    NavigationActionResult.FOCUSED -> {
+                        currentSession = session.copy(navigationScrollCount = session.navigationScrollCount + 1)
+                        scheduleProcess(700L)
+                        return
+                    }
+
+                    NavigationActionResult.FAILED -> Unit
+                }
             }
         }
 
-        if (canScrollWindow(root, session) && scrollForward(root)) {
-            retryOrFinish(session, "Scrolled while searching for target speaker or Connect button")
-            return
+        if (canScrollWindow(root, session)) {
+            if (session.navigationScrollCount >= MAX_NAVIGATION_SCROLL_ATTEMPTS) {
+                retryOrFinish(session, "Navigation skipped: device list route not found")
+                return
+            }
+            if (scrollForward(root)) {
+                val nextScrollCount = session.navigationScrollCount + 1
+                logDebug(
+                    session,
+                    "navigation scroll $nextScrollCount/$MAX_NAVIGATION_SCROLL_ATTEMPTS",
+                    focusedNodeText(root),
+                )
+                currentSession = session.copy(navigationScrollCount = nextScrollCount)
+                scheduleProcess(1_000L)
+                return
+            }
         }
 
         retryOrFinish(session, "Target speaker or Connect button not found")
@@ -311,19 +371,51 @@ class BtKeeperAccessibilityService : AccessibilityService() {
 
         if (!session.navigationClicked) {
             val pairNavigationNode = findFirstNode(root) { node ->
-                AutomationTextMatcher.isRepairPairNavigation(nodeText(node))
+                AutomationTextMatcher.isRepairPairNavigationTarget(nodeText(node))
             }
-            if (pairNavigationNode != null && safeClickClickableNode(pairNavigationNode, session, "repair pair navigation")) {
-                currentSession = session.copy(navigationClicked = true)
-                prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, "Repair pairing: opened pair flow")
-                scheduleProcess(2_000L)
-                return
+            if (pairNavigationNode != null) {
+                if (session.navigationScrollCount >= MAX_NAVIGATION_SCROLL_ATTEMPTS) {
+                    retryOrFinish(session, "Repair pairing: navigation route not focused")
+                    return
+                }
+                when (safeFocusOrClickNavigationNode(pairNavigationNode, session, "repair pair navigation")) {
+                    NavigationActionResult.CLICKED -> {
+                        currentSession = session.copy(
+                            navigationClicked = true,
+                            navigationScrollCount = 0,
+                        )
+                        prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, "Repair pairing: opened pair flow")
+                        scheduleProcess(2_000L)
+                        return
+                    }
+
+                    NavigationActionResult.FOCUSED -> {
+                        currentSession = session.copy(navigationScrollCount = session.navigationScrollCount + 1)
+                        scheduleProcess(700L)
+                        return
+                    }
+
+                    NavigationActionResult.FAILED -> Unit
+                }
             }
         }
 
-        if (canScrollWindow(root, session) && scrollForward(root)) {
-            retryOrFinish(session, "Repair pairing: scrolled while searching for ${session.targetName}")
-            return
+        if (canScrollWindow(root, session)) {
+            if (session.navigationScrollCount >= MAX_NAVIGATION_SCROLL_ATTEMPTS) {
+                retryOrFinish(session, "Repair pairing: navigation route not found")
+                return
+            }
+            if (scrollForward(root)) {
+                val nextScrollCount = session.navigationScrollCount + 1
+                logDebug(
+                    session,
+                    "repair navigation scroll $nextScrollCount/$MAX_NAVIGATION_SCROLL_ATTEMPTS",
+                    focusedNodeText(root),
+                )
+                currentSession = session.copy(navigationScrollCount = nextScrollCount)
+                scheduleProcess(1_000L)
+                return
+            }
         }
 
         retryOrFinish(session, "Repair pairing: target not visible")
@@ -405,6 +497,145 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             hasTargetConnectedContextInAncestors(connectedNode, root, targetName, targetAddress)
     }
 
+    private fun confirmTargetConnectedWithA2dp(
+        session: RuntimeSession,
+        failurePrefix: String = "Connected UI not confirmed by A2DP",
+    ) {
+        if (connectedConfirmationSessionId == session.id) {
+            return
+        }
+        val targetClickCheckStartedAt = if (failurePrefix == TARGET_ROW_CLICK_A2DP_FAILURE_PREFIX) {
+            session.targetClickCheckStartedAtMillis ?: System.currentTimeMillis()
+        } else {
+            null
+        }
+        if (targetClickCheckStartedAt != null && session.targetClickCheckStartedAtMillis == null) {
+            currentSession = session.copy(targetClickCheckStartedAtMillis = targetClickCheckStartedAt)
+        }
+        connectedConfirmationSessionId = session.id
+        logDebug(session, "$failurePrefix; confirming A2DP state")
+        BluetoothStateRepository(this).checkTargetState(session.targetName, session.targetAddress) { result ->
+            handler.post {
+                if (connectedConfirmationSessionId == session.id) {
+                    connectedConfirmationSessionId = null
+                }
+                val activeSession = currentSession
+                if (activeSession == null || activeSession.id != session.id) {
+                    return@post
+                }
+                if (result.state == SpeakerConnectionState.CONNECTED) {
+                    finishSuccess()
+                } else if (targetClickCheckStartedAt != null) {
+                    handleConnectProgressResult(
+                        session = activeSession,
+                        state = result.state,
+                        startedAtMillis = targetClickCheckStartedAt,
+                        nowMillis = System.currentTimeMillis(),
+                    )
+                } else {
+                    retryOrFinish(
+                        activeSession,
+                        "$failurePrefix: ${result.state.displayName}",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun handleConnectProgressResult(
+        session: RuntimeSession,
+        state: SpeakerConnectionState,
+        startedAtMillis: Long,
+        nowMillis: Long,
+    ) {
+        val elapsedMillis = nowMillis - startedAtMillis
+        val action = ConnectProgressRecoveryPolicy.decide(
+            retryCount = session.retryCount,
+            maxRetries = session.maxRetries,
+            elapsedMillis = elapsedMillis,
+            state = state,
+            backRecoveryCount = session.connectBackRecoveryCount,
+            freshRelaunchCount = session.connectFreshRelaunchCount,
+        )
+        val diagnostic = "state=${state.displayName} elapsed=${elapsedMillis}ms " +
+            "backRecovery=${session.connectBackRecoveryCount} " +
+            "freshRelaunch=${session.connectFreshRelaunchCount}"
+        when (action) {
+            ConnectProgressRecoveryAction.WAIT -> {
+                logDebug(session, "Connect progress still waiting for A2DP: $diagnostic")
+                scheduleProcess(TARGET_ROW_A2DP_RECHECK_INTERVAL_MILLIS)
+            }
+
+            ConnectProgressRecoveryAction.BACK_AND_RETRY -> recoverConnectProgress(
+                session = session,
+                state = state,
+                elapsedMillis = elapsedMillis,
+                action = action,
+                message = "Connect progress timed out; backing out and retrying",
+            )
+
+            ConnectProgressRecoveryAction.RELAUNCH_SETTINGS_AND_RETRY -> recoverConnectProgress(
+                session = session,
+                state = state,
+                elapsedMillis = elapsedMillis,
+                action = action,
+                message = "Connect progress timed out after Back recovery; reopening Settings and retrying",
+            )
+
+            ConnectProgressRecoveryAction.FINISH -> finishFailure(
+                "Connect progress timed out after bounded recovery: ${state.displayName}",
+            )
+        }
+    }
+
+    private fun recoverConnectProgress(
+        session: RuntimeSession,
+        state: SpeakerConnectionState,
+        elapsedMillis: Long,
+        action: ConnectProgressRecoveryAction,
+        message: String,
+    ) {
+        val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
+        val nextRetryCount = session.retryCount + 1
+        if (nextRetryCount >= session.maxRetries) {
+            finishFailure("Connect progress timed out: ${state.displayName}")
+            return
+        }
+
+        val nextSession = session.copy(
+            retryCount = nextRetryCount,
+            targetClicked = false,
+            targetClickCheckStartedAtMillis = null,
+            navigationClicked = if (action.reopenFreshSettings) false else session.navigationClicked,
+            navigationScrollCount = if (action.reopenFreshSettings) 0 else session.navigationScrollCount,
+            connectBackRecoveryCount = if (action == ConnectProgressRecoveryAction.BACK_AND_RETRY) {
+                session.connectBackRecoveryCount + 1
+            } else {
+                session.connectBackRecoveryCount
+            },
+            connectFreshRelaunchCount = if (action == ConnectProgressRecoveryAction.RELAUNCH_SETTINGS_AND_RETRY) {
+                session.connectFreshRelaunchCount + 1
+            } else {
+                session.connectFreshRelaunchCount
+            },
+        )
+        prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, safeMessage)
+        currentSession = nextSession
+        logDebug(
+            nextSession,
+            "$safeMessage state=${state.displayName} elapsed=${elapsedMillis}ms " +
+                "backRecovery=${nextSession.connectBackRecoveryCount} " +
+                "freshRelaunch=${nextSession.connectFreshRelaunchCount}",
+        )
+
+        if (action.reopenFreshSettings) {
+            SettingsLauncher.openFreshSettingsHome(this)
+        } else {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+        scheduleProcess(1_500L)
+    }
+
     private fun retryOrFinish(session: RuntimeSession, message: String) {
         val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
         val nextRetryCount = session.retryCount + 1
@@ -452,6 +683,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun finishSuccess() {
+        connectedConfirmationSessionId = null
         prefs.recordSuccess(System.currentTimeMillis())
         prefs.clearAutomationSession()
         currentSession = null
@@ -459,7 +691,24 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun finishFailure(message: String) {
-        prefs.recordFailure(SpeakerConnectionState.ERROR, message)
+        connectedConfirmationSessionId = null
+        val session = currentSession
+        val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
+        if (session?.trigger == TriggerSource.LIVE_MONITOR) {
+            val backoffUntil = prefs.recordLiveMonitorBackoff(
+                nowMillis = System.currentTimeMillis(),
+                cooldownMinutes = prefs.getSettings().cooldownMinutes,
+                reason = safeMessage,
+            )
+            logDebug(
+                session,
+                "live monitor backoff until=${backoffUntil.backoffUntilMillis} " +
+                    "nextProbeAfter=${backoffUntil.nextProbeAfterMillis} " +
+                    "failureCount=${backoffUntil.failureCount}: $safeMessage",
+            )
+        } else {
+            prefs.recordFailure(SpeakerConnectionState.ERROR, safeMessage)
+        }
         prefs.clearAutomationSession()
         currentSession = null
         performGlobalAction(GLOBAL_ACTION_HOME)
@@ -540,9 +789,32 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         root: AccessibilityNodeInfo,
         session: RuntimeSession,
     ): AccessibilityNodeInfo? {
-        return findFirstNode(root) { node ->
+        val connectNodes = mutableListOf<AccessibilityNodeInfo>()
+        traverse(root) { node ->
+            if (AutomationTextMatcher.isConnectAction(nodeText(node))) {
+                connectNodes.add(node)
+            }
+        }
+        val contextualConnect = connectNodes.firstOrNull { node ->
             AutomationTextMatcher.isConnectAction(nodeText(node)) &&
                 hasTargetContextInAncestors(node, root, session)
+        }
+        if (contextualConnect != null) {
+            return contextualConnect
+        }
+
+        return connectNodes.singleOrNull()?.takeIf {
+            AutomationSafetyPolicy.isTargetConnectContext(
+                contextText = windowText(root),
+                targetName = session.targetName,
+                targetAddress = session.targetAddress,
+            )
+        }
+    }
+
+    private fun findConnectNodeAfterTargetClick(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        return findFirstNode(root) { node ->
+            AutomationTextMatcher.isConnectAction(nodeText(node))
         }
     }
 
@@ -618,6 +890,49 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         return clicked
     }
 
+    private fun safeFocusOrClickNavigationNode(
+        startNode: AccessibilityNodeInfo,
+        session: RuntimeSession,
+        actionName: String,
+    ): NavigationActionResult {
+        val clickableNode = clickableNodeOrAncestor(startNode)
+        if (clickableNode == null) {
+            logDebug(session, "navigation rejected: no clickable node for $actionName", nodeText(startNode))
+            return NavigationActionResult.FAILED
+        }
+
+        val clickedText = subtreeText(clickableNode).ifBlank { nodeText(clickableNode) }
+        if (clickableNode.isFocused || startNode.isFocused || subtreeHasFocusedNode(clickableNode)) {
+            val clicked = clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if (clicked) {
+                logDebug(session, "clicked $actionName", clickedText)
+                return NavigationActionResult.CLICKED
+            }
+            logDebug(session, "navigation click failed: $actionName", clickedText)
+            return NavigationActionResult.FAILED
+        }
+
+        val focused = startNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS) ||
+            clickableNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        return if (focused) {
+            logDebug(session, "focused $actionName", clickedText)
+            NavigationActionResult.FOCUSED
+        } else {
+            logDebug(session, "navigation focus rejected: $actionName", clickedText)
+            NavigationActionResult.FAILED
+        }
+    }
+
+    private fun subtreeHasFocusedNode(root: AccessibilityNodeInfo): Boolean {
+        var focused = false
+        traverse(root) { node ->
+            if (node.isFocused) {
+                focused = true
+            }
+        }
+        return focused
+    }
+
     private fun clickableNodeOrAncestor(startNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var node: AccessibilityNodeInfo? = startNode
         repeat(MAX_PARENT_SEARCH_DEPTH) {
@@ -633,6 +948,13 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private fun scrollForward(root: AccessibilityNodeInfo): Boolean {
         val scrollable = findFirstNode(root) { node -> node.isScrollable }
         return scrollable?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true
+    }
+
+    private fun focusedNodeText(root: AccessibilityNodeInfo): String {
+        val focusedNode = findFirstNode(root) { node -> node.isFocused }
+        return focusedNode
+            ?.let { subtreeText(it).ifBlank { nodeText(it) } }
+            .orEmpty()
     }
 
     private fun canScrollWindow(root: AccessibilityNodeInfo, session: RuntimeSession): Boolean {
@@ -718,7 +1040,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val sessionText = if (session == null) {
             "session=none"
         } else {
-            "session=${session.id} mode=${session.mode} retry=${session.retryCount}/${session.maxRetries}"
+            "session=${session.id} trigger=${session.trigger} mode=${session.mode} retry=${session.retryCount}/${session.maxRetries}"
         }
         val nodeSuffix = nodeText
             ?.let { AutomationSafetyPolicy.shortDiagnosticText(it) }
@@ -738,6 +1060,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             targetName = targetName,
             targetAddress = targetAddress,
             maxRetries = maxRetries,
+            trigger = trigger,
             mode = mode,
             allowSingleVisibleDeviceRepair = allowSingleVisibleDeviceRepair,
         )
@@ -749,18 +1072,29 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val displayName: String,
     )
 
+    private enum class NavigationActionResult {
+        CLICKED,
+        FOCUSED,
+        FAILED,
+    }
+
     private data class RuntimeSession(
         val id: Long,
         val targetName: String,
         val targetAddress: String,
         val maxRetries: Int,
+        val trigger: TriggerSource,
         val mode: AutomationMode,
         val allowSingleVisibleDeviceRepair: Boolean,
         val retryCount: Int = 0,
         val targetClicked: Boolean = false,
         val navigationClicked: Boolean = false,
+        val navigationScrollCount: Int = 0,
         val wrongDestinationRecoveryAttempted: Boolean = false,
         val repairDeviceName: String = "",
+        val targetClickCheckStartedAtMillis: Long? = null,
+        val connectBackRecoveryCount: Int = 0,
+        val connectFreshRelaunchCount: Int = 0,
     )
 
     companion object {
@@ -769,6 +1103,11 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         private const val CONNECTION_MONITOR_INTERVAL_MILLIS = 5_000L
         private const val MONITOR_CHECK_TIMEOUT_MILLIS = 4_000L
         private const val MIN_MONITOR_RECONNECT_INTERVAL_MILLIS = 10_000L
+        private const val MAX_NAVIGATION_SCROLL_ATTEMPTS = 8
+        private const val POST_TARGET_CLICK_CHECK_DELAY_MILLIS = 4_000L
+        private const val POST_CONNECT_CLICK_CHECK_DELAY_MILLIS = 2_000L
+        private const val TARGET_ROW_A2DP_RECHECK_INTERVAL_MILLIS = 2_000L
+        private const val TARGET_ROW_CLICK_A2DP_FAILURE_PREFIX = "Target row click not confirmed by A2DP"
         private const val POST_PAIR_RECONNECT_DELAY_MILLIS = 5_000L
         private const val POST_PAIR_HOME_DELAY_MILLIS = 7_000L
         private const val PAIRING_ASSIST_TITLE = "Speaker pairing needed"

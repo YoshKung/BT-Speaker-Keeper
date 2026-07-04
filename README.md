@@ -89,6 +89,8 @@ If the target speaker is no longer bonded/paired and Auto Connect is on, the app
 
 The live monitor uses public A2DP state checks only. It can bypass the long user cooldown so repair starts quickly after a disconnect, but it still requires Auto Connect, skips while playback is active when that safety control is enabled, avoids concurrent sessions, and throttles Settings launches.
 
+If a live-monitor reconnect attempt cannot find the configured speaker or cannot confirm connection after clicking the target row, the app backs off before trying again. The backoff uses the configured Cooldown value, with a 2 minute minimum if Cooldown is set to 0, but it allows a guarded live-monitor probe about every 30 seconds during that window so a speaker power-cycle can recover without waiting the full cooldown. Manual **Connect Now** and **Repair Pair Now** still run immediately.
+
 When the saved alias disappears, Google TV may show the same speaker under a factory discovery name. BT Speaker Keeper stores the public Bluetooth address from scans or the visible pairing row so later repair attempts can still find it. Manual **Repair Pair Now** may select the only focused/visible discovered device if no saved address is available; automatic repair does not use that broad fallback.
 
 If repair pairing reaches a canceled/not-ready state such as `Pairing canceled` or `ถูกยกเลิก`, the app does not silently return Home. It opens the pairing assist prompt and retries only while that prompt is visible.
@@ -98,12 +100,13 @@ If repair pairing reaches a canceled/not-ready state such as `Pairing canceled` 
 When the target speaker appears disconnected, the app opens Bluetooth Settings and the Accessibility Service:
 
 - avoids resuming the last unrelated Settings page when direct Bluetooth Settings is unavailable;
-- can open a fresh Settings home and navigate only through Bluetooth / Accessories / Remotes & Accessories labels;
+- can open a fresh Settings home, scroll the Settings navigation list, and click only exact Bluetooth / Accessories / Remotes & Accessories route labels;
 - searches the active window tree for the configured speaker name;
-- clicks the speaker row or clickable parent;
 - searches for `Connect` or `เชื่อมต่อ`;
-- clicks the Connect action when found;
-- detects `Connected` or `เชื่อมต่อแล้ว`;
+- clicks the Connect action first when it is in the configured speaker context, including saved-device pages where the speaker name is text-only and the action is a sibling button;
+- otherwise clicks the speaker row or clickable parent, then gives Google TV up to about 12 seconds to connect if that row click opens a progress state;
+- if that saved-device progress state gets stuck, backs out once, resets the click state, and retries the target-context Connect search; if needed it then relaunches fresh Settings once before failing/backing off;
+- detects `Connected` or `เชื่อมต่อแล้ว` only when it is not a disconnected label such as `เลิกเชื่อมต่อแล้ว`, then confirms the target is connected through public A2DP state before treating automation as successful;
 - retries up to the configured max retry count;
 - returns to Home after success or failure.
 
@@ -115,6 +118,7 @@ The Accessibility Service also watches live windows for a Bluetooth pairing prom
 - the prompt/window contains the configured target speaker name;
 - the prompt/window comes from a Settings, Bluetooth, or system package;
 - the prompt/window is not a Wi-Fi / Wireless debugging / ADB pairing screen;
+- Thai Wireless debugging screens such as `การแก้ไขข้อบกพร่องผ่าน Wi-Fi` and pair-by-code / QR-code rows are also treated as unsafe;
 - the live-pair cooldown has elapsed.
 
 Explicit **Repair Pair Now** sessions use the same target-name and Wi-Fi/ADB guards, and may accept the target prompt as part of that user-started repair flow.

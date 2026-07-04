@@ -4,6 +4,7 @@ enum class AutomationWindowKind {
     UNSAFE,
     TARGET_CONTEXT,
     ALLOWED_NAVIGATION,
+    SETTINGS_HOME,
     WRONG_DESTINATION,
     NEUTRAL,
 }
@@ -46,6 +47,10 @@ object AutomationSafetyPolicy {
             return AutomationWindowClassification(AutomationWindowKind.ALLOWED_NAVIGATION)
         }
 
+        if (AutomationTextMatcher.isSettingsHome(windowText)) {
+            return AutomationWindowClassification(AutomationWindowKind.SETTINGS_HOME)
+        }
+
         if (AutomationTextMatcher.isWrongSettingsDestination(windowText)) {
             return AutomationWindowClassification(
                 AutomationWindowKind.WRONG_DESTINATION,
@@ -73,6 +78,15 @@ object AutomationSafetyPolicy {
             AutomationTextMatcher.containsConnectedState(contextText)
     }
 
+    fun isTargetConnectContext(
+        contextText: CharSequence?,
+        targetName: CharSequence?,
+        targetAddress: CharSequence?,
+    ): Boolean {
+        return hasTargetContext(contextText, targetName, targetAddress) &&
+            AutomationTextMatcher.containsConnectAction(contextText)
+    }
+
     fun isUnsafeSingleVisibleRepairCandidate(text: CharSequence?): Boolean {
         val normalized = AutomationTextMatcher.normalize(text)
         return normalized.isBlank() ||
@@ -92,7 +106,8 @@ object AutomationSafetyPolicy {
     ): Boolean {
         val classification = classifyAutomationWindow(windowText, mode, targetName, targetAddress)
         return classification.kind == AutomationWindowKind.TARGET_CONTEXT ||
-            classification.kind == AutomationWindowKind.ALLOWED_NAVIGATION
+            classification.kind == AutomationWindowKind.ALLOWED_NAVIGATION ||
+            classification.kind == AutomationWindowKind.SETTINGS_HOME
     }
 
     fun shortDiagnosticText(value: CharSequence?, maxLength: Int = DEFAULT_DIAGNOSTIC_TEXT_LENGTH): String {

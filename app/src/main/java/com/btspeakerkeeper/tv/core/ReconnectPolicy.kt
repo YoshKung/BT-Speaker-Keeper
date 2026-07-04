@@ -34,6 +34,18 @@ class ReconnectPolicy {
             return ReconnectDecision.Skip("Playback active")
         }
 
+        if (
+            trigger == TriggerSource.LIVE_MONITOR &&
+            runtime.liveMonitorBackoffUntilMillis != null &&
+            nowMillis < runtime.liveMonitorBackoffUntilMillis
+        ) {
+            val nextProbeAfter = runtime.liveMonitorNextProbeAfterMillis
+            if (nextProbeAfter == null || nowMillis >= nextProbeAfter) {
+                return ReconnectDecision.Proceed
+            }
+            return ReconnectDecision.Skip("Live monitor backoff active")
+        }
+
         val cooldownMillis = settings.cooldownMinutes.coerceAtLeast(0) * 60_000L
         val lastAttemptAt = runtime.lastAttemptAtMillis
         if (!trigger.bypassCooldown && cooldownMillis > 0 && lastAttemptAt != null) {

@@ -30,6 +30,21 @@ class AutomationSafetyPolicyTest {
     }
 
     @Test
+    fun classifiesThaiWirelessDebuggingScreenAsUnsafe() {
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = "การแก้ไขข้อบกพร่อง ผ่าน Wi-Fi ปิดใช้ เปิดใช้ " +
+                "จับคู่อุปกรณ์ด้วยรหัสการจับคู่ ชื่ออุปกรณ์ Dining room TV " +
+                "ที่อยู่ IP และพอร์ต 203.0.113.10:45678",
+            mode = AutomationMode.CONNECT,
+            targetName = "Demo Speaker",
+            targetAddress = "",
+        )
+
+        assertEquals(AutomationWindowKind.UNSAFE, classification.kind)
+        assertEquals("Unsafe window: Wireless debugging or ADB pairing screen", classification.reason)
+    }
+
+    @Test
     fun classifiesAppsSecurityAsWrongDestination() {
         val classification = AutomationSafetyPolicy.classifyAutomationWindow(
             windowText = "แอป ความปลอดภัย สแกนแอปด้วย Play Protect สิทธิ์ของแอป",
@@ -65,6 +80,26 @@ class AutomationSafetyPolicyTest {
         )
 
         assertEquals(AutomationWindowKind.ALLOWED_NAVIGATION, classification.kind)
+    }
+
+    @Test
+    fun classifiesSettingsHomeWithoutVisibleBluetoothRouteAsSettingsHome() {
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = "การตั้งค่า การแสดงผลและเสียง เครือข่ายและอินเทอร์เน็ต บัญชีและโปรไฟล์ ความเป็นส่วนตัว แอป ระบบ",
+            mode = AutomationMode.CONNECT,
+            targetName = "Demo Speaker",
+            targetAddress = "",
+        )
+
+        assertEquals(AutomationWindowKind.SETTINGS_HOME, classification.kind)
+        assertTrue(
+            AutomationSafetyPolicy.canScrollAutomationWindow(
+                windowText = "การตั้งค่า การแสดงผลและเสียง เครือข่ายและอินเทอร์เน็ต บัญชีและโปรไฟล์",
+                mode = AutomationMode.CONNECT,
+                targetName = "Demo Speaker",
+                targetAddress = "",
+            ),
+        )
     }
 
     @Test
@@ -126,6 +161,38 @@ class AutomationSafetyPolicyTest {
         assertFalse(
             AutomationSafetyPolicy.isTargetConnectedContext(
                 contextText = "Kitchen speaker Connected",
+                targetName = "Demo Speaker",
+                targetAddress = "",
+            ),
+        )
+    }
+
+    @Test
+    fun treatsSavedDeviceConnectAsTargetConnectContext() {
+        assertTrue(
+            AutomationSafetyPolicy.isTargetConnectContext(
+                contextText = "Demo Speaker เชื่อมต่อ",
+                targetName = "Demo Speaker",
+                targetAddress = "",
+            ),
+        )
+        assertTrue(
+            AutomationSafetyPolicy.isTargetConnectContext(
+                contextText = "Factory Name AA:BB:CC:DD:EE:FF Connect",
+                targetName = "Demo Speaker",
+                targetAddress = "AA:BB:CC:DD:EE:FF",
+            ),
+        )
+        assertFalse(
+            AutomationSafetyPolicy.isTargetConnectContext(
+                contextText = "Kitchen speaker Connect",
+                targetName = "Demo Speaker",
+                targetAddress = "AA:BB:CC:DD:EE:FF",
+            ),
+        )
+        assertFalse(
+            AutomationSafetyPolicy.isTargetConnectContext(
+                contextText = "Demo Speaker Connected",
                 targetName = "Demo Speaker",
                 targetAddress = "",
             ),

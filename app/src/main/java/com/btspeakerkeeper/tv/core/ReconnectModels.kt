@@ -42,6 +42,9 @@ data class ReconnectSettings(
 data class ReconnectRuntimeState(
     val inProgress: Boolean,
     val lastAttemptAtMillis: Long?,
+    val liveMonitorBackoffUntilMillis: Long? = null,
+    val liveMonitorNextProbeAfterMillis: Long? = null,
+    val liveMonitorFailureCount: Int = 0,
 )
 
 sealed class ReconnectDecision {

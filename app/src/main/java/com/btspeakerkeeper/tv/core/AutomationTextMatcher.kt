@@ -4,6 +4,13 @@ object AutomationTextMatcher {
     private val connectActions = setOf("Connect", "เชื่อมต่อ")
     private val pairActions = setOf("Pair", "Pair device", "จับคู่", "จับคู่อุปกรณ์")
     private val connectedStates = setOf("Connected", "เชื่อมต่อแล้ว")
+    private val disconnectedStates = setOf(
+        "Disconnected",
+        "Not connected",
+        "เลิกเชื่อมต่อแล้ว",
+        "ไม่ได้เชื่อมต่อ",
+        "ไม่เชื่อมต่อ",
+    )
     private val pairingNotReadyStates = setOf(
         "Canceled",
         "Cancelled",
@@ -29,10 +36,21 @@ object AutomationTextMatcher {
         "Wi-Fi pairing code",
         "Wi‑Fi pairing code",
         "Wireless debugging",
+        "Pair device with pairing code",
+        "Pair device with QR code",
+        "Pair with QR code",
+        "QR code",
         "ที่อยู่ IP และพอร์ต",
         "รหัสการจับคู่ Wi-Fi",
         "รหัสการจับคู่ Wi‑Fi",
         "การแก้ไขข้อบกพร่องแบบไร้สาย",
+        "การแก้ไขข้อบกพร่องผ่าน Wi-Fi",
+        "การแก้ไขข้อบกพร่องผ่าน Wi‑Fi",
+        "การแก้ไขข้อบกพร่อง ผ่าน Wi-Fi",
+        "การแก้ไขข้อบกพร่อง ผ่าน Wi‑Fi",
+        "จับคู่อุปกรณ์ด้วยรหัสการจับคู่",
+        "จับคู่อุปกรณ์ด้วยคิวอาร์โค้ด",
+        "คิวอาร์โค้ด",
     )
     private val deviceListNavigationTexts = setOf(
         "Accessories",
@@ -51,6 +69,27 @@ object AutomationTextMatcher {
         "อุปกรณ์ที่รู้จัก",
         "อุปกรณ์เสริม",
         "รีโมตและอุปกรณ์เสริม",
+    )
+    private val settingsHomeTitleTexts = setOf(
+        "Settings",
+        "การตั้งค่า",
+    )
+    private val settingsHomeCategoryTexts = setOf(
+        "Display & Sound",
+        "Display and Sound",
+        "Network & Internet",
+        "Accounts & Sign-in",
+        "Accounts & Profiles",
+        "Privacy",
+        "Apps",
+        "System",
+        "การแสดงผลและเสียง",
+        "เครือข่ายและอินเทอร์เน็ต",
+        "บัญชีและการลงชื่อเข้าใช้",
+        "บัญชีและโปรไฟล์",
+        "ความเป็นส่วนตัว",
+        "แอป",
+        "ระบบ",
     )
     private val repairPairNavigationTexts = setOf(
         "Pair remote or accessory",
@@ -111,6 +150,15 @@ object AutomationTextMatcher {
         return normalize(value) in connectActions
     }
 
+    fun containsConnectAction(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        if (isConnectAction(normalized)) {
+            return true
+        }
+        val tokens = normalized.split(Regex("\\s+")).filter { it.isNotBlank() }
+        return tokens.any { token -> token in connectActions }
+    }
+
     fun isPairAction(value: CharSequence?): Boolean {
         return normalize(value) in pairActions
     }
@@ -121,6 +169,9 @@ object AutomationTextMatcher {
 
     fun containsConnectedState(value: CharSequence?): Boolean {
         val normalized = normalize(value)
+        if (disconnectedStates.any { state -> normalized == state || normalized.contains(state) }) {
+            return false
+        }
         return connectedStates.any { state -> normalized.contains(state) }
     }
 
@@ -142,11 +193,31 @@ object AutomationTextMatcher {
         }
     }
 
+    fun isDeviceListNavigationTarget(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        return deviceListNavigationTexts.any { text -> normalized == text }
+    }
+
     fun isRepairPairNavigation(value: CharSequence?): Boolean {
         val normalized = normalize(value)
         return repairPairNavigationTexts.any { text ->
             normalized == text || normalized.contains(text)
         }
+    }
+
+    fun isRepairPairNavigationTarget(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        return repairPairNavigationTexts.any { text -> normalized == text }
+    }
+
+    fun isSettingsHome(value: CharSequence?): Boolean {
+        val normalized = normalize(value)
+        val hasTitle = settingsHomeTitleTexts.any { text -> normalized.contains(text) }
+        if (!hasTitle) {
+            return false
+        }
+        val matchedCategoryCount = settingsHomeCategoryTexts.count { text -> normalized.contains(text) }
+        return matchedCategoryCount >= MIN_SETTINGS_HOME_CATEGORY_MATCHES
     }
 
     fun containsPairingPromptExclusion(value: CharSequence?): Boolean {
@@ -167,4 +238,6 @@ object AutomationTextMatcher {
             normalized == text || normalized.contains(text)
         }
     }
+
+    private const val MIN_SETTINGS_HOME_CATEGORY_MATCHES = 2
 }

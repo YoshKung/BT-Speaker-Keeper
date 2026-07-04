@@ -110,6 +110,107 @@ class ReconnectPolicyTest {
     }
 
     @Test
+    fun liveMonitorRespectsBackoffAfterAutomationFailure() {
+        val decision = policy.decide(
+            settings = settings,
+            runtime = ReconnectRuntimeState(
+                inProgress = false,
+                lastAttemptAtMillis = 60_000L,
+                liveMonitorBackoffUntilMillis = 180_000L,
+                liveMonitorNextProbeAfterMillis = 170_000L,
+            ),
+            trigger = TriggerSource.LIVE_MONITOR,
+            nowMillis = 120_000L,
+            isPlaybackActive = false,
+            isAccessibilityEnabled = true,
+            hasBluetoothPermission = true,
+        )
+
+        assertEquals(ReconnectDecision.Skip("Live monitor backoff active"), decision)
+    }
+
+    @Test
+    fun liveMonitorProbeRunsDuringBackoffWhenProbeTimeArrives() {
+        val decision = policy.decide(
+            settings = settings,
+            runtime = ReconnectRuntimeState(
+                inProgress = false,
+                lastAttemptAtMillis = 60_000L,
+                liveMonitorBackoffUntilMillis = 180_000L,
+                liveMonitorNextProbeAfterMillis = 120_000L,
+                liveMonitorFailureCount = 1,
+            ),
+            trigger = TriggerSource.LIVE_MONITOR,
+            nowMillis = 120_000L,
+            isPlaybackActive = false,
+            isAccessibilityEnabled = true,
+            hasBluetoothPermission = true,
+        )
+
+        assertTrue(decision is ReconnectDecision.Proceed)
+    }
+
+    @Test
+    fun liveMonitorLegacyBackoffWithoutProbeRunsOnceAfterUpgrade() {
+        val decision = policy.decide(
+            settings = settings,
+            runtime = ReconnectRuntimeState(
+                inProgress = false,
+                lastAttemptAtMillis = 60_000L,
+                liveMonitorBackoffUntilMillis = 180_000L,
+                liveMonitorNextProbeAfterMillis = null,
+            ),
+            trigger = TriggerSource.LIVE_MONITOR,
+            nowMillis = 120_000L,
+            isPlaybackActive = false,
+            isAccessibilityEnabled = true,
+            hasBluetoothPermission = true,
+        )
+
+        assertTrue(decision is ReconnectDecision.Proceed)
+    }
+
+    @Test
+    fun manualTriggerIgnoresLiveMonitorBackoff() {
+        val decision = policy.decide(
+            settings = settings,
+            runtime = ReconnectRuntimeState(
+                inProgress = false,
+                lastAttemptAtMillis = 60_000L,
+                liveMonitorBackoffUntilMillis = 180_000L,
+                liveMonitorNextProbeAfterMillis = 170_000L,
+            ),
+            trigger = TriggerSource.MANUAL,
+            nowMillis = 120_000L,
+            isPlaybackActive = false,
+            isAccessibilityEnabled = true,
+            hasBluetoothPermission = true,
+        )
+
+        assertTrue(decision is ReconnectDecision.Proceed)
+    }
+
+    @Test
+    fun bootTriggerIgnoresLiveMonitorBackoffState() {
+        val decision = policy.decide(
+            settings = settings,
+            runtime = ReconnectRuntimeState(
+                inProgress = false,
+                lastAttemptAtMillis = null,
+                liveMonitorBackoffUntilMillis = 180_000L,
+                liveMonitorNextProbeAfterMillis = 170_000L,
+            ),
+            trigger = TriggerSource.BOOT,
+            nowMillis = 120_000L,
+            isPlaybackActive = false,
+            isAccessibilityEnabled = true,
+            hasBluetoothPermission = true,
+        )
+
+        assertTrue(decision is ReconnectDecision.Proceed)
+    }
+
+    @Test
     fun liveMonitorRespectsPlaybackSafety() {
         val decision = policy.decide(
             settings = settings,

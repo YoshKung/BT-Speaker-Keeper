@@ -3,6 +3,7 @@ package com.btspeakerkeeper.tv.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.btspeakerkeeper.tv.core.AutomationMode
+import com.btspeakerkeeper.tv.core.AutomationSessionGuards
 import com.btspeakerkeeper.tv.core.ReconnectSettings
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
 import com.btspeakerkeeper.tv.core.TriggerSource
@@ -81,6 +82,10 @@ class AppPrefs(context: Context) {
             .putString(KEY_LAST_ERROR, "")
             .putLong(KEY_LAST_SUCCESS_AT, nowMillis)
             .putBoolean(KEY_AUTOMATION_ACTIVE, false)
+            .remove(KEY_LIVE_MONITOR_BACKOFF_UNTIL)
+            .remove(KEY_LIVE_MONITOR_NEXT_PROBE_AFTER)
+            .remove(KEY_LIVE_MONITOR_FAILURE_COUNT)
+            .remove(KEY_LIVE_MONITOR_LAST_FAILURE_REASON)
             .apply()
     }
 
@@ -96,6 +101,7 @@ class AppPrefs(context: Context) {
         targetName: String,
         targetAddress: String,
         maxRetries: Int,
+        trigger: TriggerSource,
         mode: AutomationMode = AutomationMode.CONNECT,
         allowSingleVisibleDeviceRepair: Boolean = false,
     ): AutomationSession {
@@ -104,6 +110,7 @@ class AppPrefs(context: Context) {
             targetName = targetName,
             targetAddress = targetAddress,
             maxRetries = maxRetries.coerceIn(1, 10),
+            trigger = trigger,
             mode = mode,
             allowSingleVisibleDeviceRepair = allowSingleVisibleDeviceRepair,
         )
@@ -113,6 +120,7 @@ class AppPrefs(context: Context) {
             .putString(KEY_AUTOMATION_TARGET, session.targetName)
             .putString(KEY_AUTOMATION_TARGET_ADDRESS, session.targetAddress)
             .putInt(KEY_AUTOMATION_MAX_RETRIES, session.maxRetries)
+            .putString(KEY_AUTOMATION_TRIGGER, session.trigger.name)
             .putString(KEY_AUTOMATION_MODE, session.mode.name)
             .putBoolean(KEY_AUTOMATION_SINGLE_DEVICE_REPAIR, session.allowSingleVisibleDeviceRepair)
             .putString(KEY_LAST_STATE, SpeakerConnectionState.AUTOMATION_STARTED.displayName)
@@ -125,15 +133,21 @@ class AppPrefs(context: Context) {
         if (!prefs.getBoolean(KEY_AUTOMATION_ACTIVE, false)) {
             return null
         }
+        val sessionId = prefs.getLong(KEY_AUTOMATION_ID, 0L)
+        if (isStaleAutomationSession(sessionId)) {
+            clearStaleAutomationSession()
+            return null
+        }
         val target = prefs.getString(KEY_AUTOMATION_TARGET, "").orEmpty()
         if (target.isBlank()) {
             return null
         }
         return AutomationSession(
-            id = prefs.getLong(KEY_AUTOMATION_ID, 0L),
+            id = sessionId,
             targetName = target,
             targetAddress = prefs.getString(KEY_AUTOMATION_TARGET_ADDRESS, "").orEmpty(),
             maxRetries = prefs.getInt(KEY_AUTOMATION_MAX_RETRIES, DEFAULT_MAX_RETRIES).coerceIn(1, 10),
+            trigger = triggerSourceFromPrefs(),
             mode = automationModeFromPrefs(),
             allowSingleVisibleDeviceRepair = prefs.getBoolean(KEY_AUTOMATION_SINGLE_DEVICE_REPAIR, false),
         )
@@ -146,14 +160,78 @@ class AppPrefs(context: Context) {
             .remove(KEY_AUTOMATION_TARGET)
             .remove(KEY_AUTOMATION_TARGET_ADDRESS)
             .remove(KEY_AUTOMATION_MAX_RETRIES)
+            .remove(KEY_AUTOMATION_TRIGGER)
             .remove(KEY_AUTOMATION_MODE)
             .remove(KEY_AUTOMATION_SINGLE_DEVICE_REPAIR)
             .apply()
     }
 
+    fun getLiveMonitorBackoffUntilMillis(): Long? {
+        return prefs.getLong(KEY_LIVE_MONITOR_BACKOFF_UNTIL, 0L).takeIf { it > 0L }
+    }
+
+    fun getLiveMonitorNextProbeAfterMillis(): Long? {
+        return prefs.getLong(KEY_LIVE_MONITOR_NEXT_PROBE_AFTER, 0L).takeIf { it > 0L }
+    }
+
+    fun getLiveMonitorFailureCount(): Int {
+        return prefs.getInt(KEY_LIVE_MONITOR_FAILURE_COUNT, 0).coerceAtLeast(0)
+    }
+
+    fun getLiveMonitorLastFailureReason(): String {
+        return prefs.getString(KEY_LIVE_MONITOR_LAST_FAILURE_REASON, "").orEmpty()
+    }
+
+    fun recordLiveMonitorBackoff(nowMillis: Long, cooldownMinutes: Int, reason: String): LiveMonitorBackoffRecord {
+        val failureCount = getLiveMonitorFailureCount() + 1
+        val backoffUntil = AutomationSessionGuards.liveMonitorBackoffUntil(
+            nowMillis = nowMillis,
+            cooldownMinutes = cooldownMinutes,
+            currentBackoffUntilMillis = getLiveMonitorBackoffUntilMillis(),
+        )
+        val nextProbeAfter = AutomationSessionGuards.nextLiveMonitorProbeAfter(nowMillis)
+        prefs.edit()
+            .putLong(KEY_LIVE_MONITOR_BACKOFF_UNTIL, backoffUntil)
+            .putLong(KEY_LIVE_MONITOR_NEXT_PROBE_AFTER, nextProbeAfter)
+            .putInt(KEY_LIVE_MONITOR_FAILURE_COUNT, failureCount)
+            .putString(KEY_LIVE_MONITOR_LAST_FAILURE_REASON, reason)
+            .putString(KEY_LAST_STATE, SpeakerConnectionState.ERROR.displayName)
+            .putString(KEY_LAST_ERROR, reason)
+            .apply()
+        return LiveMonitorBackoffRecord(
+            backoffUntilMillis = backoffUntil,
+            nextProbeAfterMillis = nextProbeAfter,
+            failureCount = failureCount,
+        )
+    }
+
     private fun automationModeFromPrefs(): AutomationMode {
         val modeName = prefs.getString(KEY_AUTOMATION_MODE, AutomationMode.CONNECT.name).orEmpty()
         return runCatching { AutomationMode.valueOf(modeName) }.getOrDefault(AutomationMode.CONNECT)
+    }
+
+    private fun triggerSourceFromPrefs(): TriggerSource {
+        val triggerName = prefs.getString(KEY_AUTOMATION_TRIGGER, TriggerSource.MANUAL.name).orEmpty()
+        return runCatching { TriggerSource.valueOf(triggerName) }.getOrDefault(TriggerSource.MANUAL)
+    }
+
+    private fun isStaleAutomationSession(sessionId: Long): Boolean {
+        return AutomationSessionGuards.isStaleAutomationSession(sessionId, System.currentTimeMillis())
+    }
+
+    private fun clearStaleAutomationSession() {
+        prefs.edit()
+            .putBoolean(KEY_AUTOMATION_ACTIVE, false)
+            .remove(KEY_AUTOMATION_ID)
+            .remove(KEY_AUTOMATION_TARGET)
+            .remove(KEY_AUTOMATION_TARGET_ADDRESS)
+            .remove(KEY_AUTOMATION_MAX_RETRIES)
+            .remove(KEY_AUTOMATION_TRIGGER)
+            .remove(KEY_AUTOMATION_MODE)
+            .remove(KEY_AUTOMATION_SINGLE_DEVICE_REPAIR)
+            .putString(KEY_LAST_STATE, SpeakerConnectionState.ERROR.displayName)
+            .putString(KEY_LAST_ERROR, "Stale automation session cleared")
+            .apply()
     }
 
     companion object {
@@ -179,8 +257,13 @@ class AppPrefs(context: Context) {
         private const val KEY_AUTOMATION_TARGET = "automation_target"
         private const val KEY_AUTOMATION_TARGET_ADDRESS = "automation_target_address"
         private const val KEY_AUTOMATION_MAX_RETRIES = "automation_max_retries"
+        private const val KEY_AUTOMATION_TRIGGER = "automation_trigger"
         private const val KEY_AUTOMATION_MODE = "automation_mode"
         private const val KEY_AUTOMATION_SINGLE_DEVICE_REPAIR = "automation_single_device_repair"
+        private const val KEY_LIVE_MONITOR_BACKOFF_UNTIL = "live_monitor_backoff_until"
+        private const val KEY_LIVE_MONITOR_NEXT_PROBE_AFTER = "live_monitor_next_probe_after"
+        private const val KEY_LIVE_MONITOR_FAILURE_COUNT = "live_monitor_failure_count"
+        private const val KEY_LIVE_MONITOR_LAST_FAILURE_REASON = "live_monitor_last_failure_reason"
 
         const val DEFAULT_MAX_RETRIES = 3
         const val DEFAULT_COOLDOWN_MINUTES = 10
@@ -202,6 +285,13 @@ data class AutomationSession(
     val targetName: String,
     val targetAddress: String,
     val maxRetries: Int,
+    val trigger: TriggerSource,
     val mode: AutomationMode = AutomationMode.CONNECT,
     val allowSingleVisibleDeviceRepair: Boolean = false,
+)
+
+data class LiveMonitorBackoffRecord(
+    val backoffUntilMillis: Long,
+    val nextProbeAfterMillis: Long,
+    val failureCount: Int,
 )

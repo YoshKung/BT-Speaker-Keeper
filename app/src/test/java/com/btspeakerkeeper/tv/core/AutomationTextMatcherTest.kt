@@ -12,6 +12,14 @@ class AutomationTextMatcherTest {
     }
 
     @Test
+    fun recognizesConnectActionInsideSavedDeviceContextText() {
+        assertTrue(AutomationTextMatcher.containsConnectAction("Demo Speaker Connect"))
+        assertTrue(AutomationTextMatcher.containsConnectAction("Demo Speaker เชื่อมต่อ"))
+        assertFalse(AutomationTextMatcher.containsConnectAction("Demo Speaker Connected"))
+        assertFalse(AutomationTextMatcher.containsConnectAction("Demo Speaker เชื่อมต่อแล้ว"))
+    }
+
+    @Test
     fun doesNotTreatConnectedStateAsConnectAction() {
         assertFalse(AutomationTextMatcher.isConnectAction("Connected"))
         assertFalse(AutomationTextMatcher.isConnectAction("เชื่อมต่อแล้ว"))
@@ -24,11 +32,24 @@ class AutomationTextMatcherTest {
     }
 
     @Test
+    fun doesNotTreatDisconnectedThaiStateAsConnected() {
+        assertFalse(AutomationTextMatcher.containsConnectedState("เลิกเชื่อมต่อแล้ว"))
+        assertFalse(AutomationTextMatcher.containsConnectedState("Demo Speaker เลิกเชื่อมต่อแล้ว"))
+    }
+
+    @Test
     fun recognizesDeviceListNavigationLabels() {
         assertTrue(AutomationTextMatcher.isDeviceListNavigation("Previously connected devices"))
         assertTrue(AutomationTextMatcher.isDeviceListNavigation("Remotes & Accessories"))
         assertTrue(AutomationTextMatcher.isDeviceListNavigation("อุปกรณ์ที่บันทึกไว้"))
         assertTrue(AutomationTextMatcher.isDeviceListNavigation("รีโมตและอุปกรณ์เสริม"))
+    }
+
+    @Test
+    fun recognizesOnlyExactDeviceListNavigationClickTargets() {
+        assertTrue(AutomationTextMatcher.isDeviceListNavigationTarget("Remotes & Accessories"))
+        assertTrue(AutomationTextMatcher.isDeviceListNavigationTarget("รีโมตและอุปกรณ์เสริม"))
+        assertFalse(AutomationTextMatcher.isDeviceListNavigationTarget("Settings Remotes & Accessories Apps"))
     }
 
     @Test
@@ -64,6 +85,12 @@ class AutomationTextMatcherTest {
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("รหัสการจับคู่ Wi‑Fi 123456"))
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("IP address and port 192.0.2.10:46353"))
         assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("Wireless debugging"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("Pair device with pairing code"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("Pair device with QR code"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("การแก้ไขข้อบกพร่องผ่าน Wi-Fi"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("จับคู่อุปกรณ์ด้วยรหัสการจับคู่"))
+        assertTrue(AutomationTextMatcher.containsPairingPromptExclusion("จับคู่อุปกรณ์ด้วยคิวอาร์โค้ด"))
+        assertFalse(AutomationTextMatcher.containsPairingPromptExclusion("ปิดใช้ เปิดใช้"))
     }
 
     @Test
@@ -85,6 +112,21 @@ class AutomationTextMatcherTest {
     fun doesNotTreatBareAppsCategoryAsWrongDestination() {
         assertFalse(AutomationTextMatcher.isWrongSettingsDestination("Apps"))
         assertFalse(AutomationTextMatcher.isWrongSettingsDestination("แอป"))
+    }
+
+    @Test
+    fun recognizesGoogleTvSettingsHome() {
+        assertTrue(
+            AutomationTextMatcher.isSettingsHome(
+                "การตั้งค่า การแสดงผลและเสียง เครือข่ายและอินเทอร์เน็ต บัญชีและโปรไฟล์ ความเป็นส่วนตัว แอป ระบบ",
+            ),
+        )
+        assertTrue(
+            AutomationTextMatcher.isSettingsHome(
+                "Settings Display & Sound Network & Internet Accounts & Profiles Privacy Apps System",
+            ),
+        )
+        assertFalse(AutomationTextMatcher.isSettingsHome("Developer options USB debugging Stay awake"))
     }
 
     @Test

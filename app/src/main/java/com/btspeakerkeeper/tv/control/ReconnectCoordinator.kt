@@ -1,8 +1,10 @@
 package com.btspeakerkeeper.tv.control
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import com.btspeakerkeeper.tv.bluetooth.BluetoothStateRepository
 import com.btspeakerkeeper.tv.core.AutomationMode
 import com.btspeakerkeeper.tv.core.ReconnectAutomationPlanner
@@ -27,11 +29,17 @@ object ReconnectCoordinator {
         val status = prefs.getStatus()
         val bluetooth = BluetoothStateRepository(appContext)
         val now = System.currentTimeMillis()
+        val liveMonitorBackoffUntil = prefs.getLiveMonitorBackoffUntilMillis()
+        val liveMonitorNextProbeAfter = prefs.getLiveMonitorNextProbeAfterMillis()
+        val liveMonitorFailureCount = prefs.getLiveMonitorFailureCount()
         val decision = policy.decide(
             settings = settings,
             runtime = ReconnectRuntimeState(
                 inProgress = checkingInProgress || status.automationActive,
                 lastAttemptAtMillis = status.lastAttemptAtMillis,
+                liveMonitorBackoffUntilMillis = liveMonitorBackoffUntil,
+                liveMonitorNextProbeAfterMillis = liveMonitorNextProbeAfter,
+                liveMonitorFailureCount = liveMonitorFailureCount,
             ),
             trigger = trigger,
             nowMillis = now,
@@ -41,8 +49,34 @@ object ReconnectCoordinator {
         )
 
         when (decision) {
-            ReconnectDecision.Proceed -> beginBluetoothCheck(appContext, prefs, bluetooth, trigger)
-            is ReconnectDecision.Skip -> prefs.recordSkipped(trigger, decision.reason)
+            ReconnectDecision.Proceed -> {
+                if (
+                    trigger == TriggerSource.LIVE_MONITOR &&
+                    liveMonitorBackoffUntil != null &&
+                    now < liveMonitorBackoffUntil
+                ) {
+                    logDebug(
+                        appContext,
+                        "Live monitor probe allowed during backoff " +
+                            "backoffUntil=$liveMonitorBackoffUntil " +
+                            "nextProbeAfter=$liveMonitorNextProbeAfter " +
+                            "failureCount=$liveMonitorFailureCount",
+                    )
+                }
+                beginBluetoothCheck(appContext, prefs, bluetooth, trigger)
+            }
+
+            is ReconnectDecision.Skip -> {
+                if (trigger == TriggerSource.LIVE_MONITOR && decision.reason == "Live monitor backoff active") {
+                    logDebug(
+                        appContext,
+                        "Probe skipped until $liveMonitorNextProbeAfter " +
+                            "backoffUntil=$liveMonitorBackoffUntil " +
+                            "failureCount=$liveMonitorFailureCount",
+                    )
+                }
+                prefs.recordSkipped(trigger, decision.reason)
+            }
         }
     }
 
@@ -82,6 +116,7 @@ object ReconnectCoordinator {
                                     targetName = settings.targetDeviceName,
                                     targetAddress = settings.targetDeviceAddress,
                                     maxRetries = settings.maxRetryCount,
+                                    trigger = trigger,
                                     mode = automationMode,
                                     allowSingleVisibleDeviceRepair = trigger == TriggerSource.REPAIR_PAIR,
                                 )
@@ -104,4 +139,13 @@ object ReconnectCoordinator {
             }
         }
     }
+
+    private fun logDebug(context: Context, message: String) {
+        if ((context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            return
+        }
+        Log.d(TAG, message)
+    }
+
+    private const val TAG = "BtKeeperReconnect"
 }

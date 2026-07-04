@@ -85,9 +85,9 @@ Before any UI automation runs, the app checks the target speaker with public Blu
 
 If the speaker is already connected, the app logs that state and does not open Settings.
 
-If the target speaker is no longer bonded/paired and Auto Connect is on, the app can start a repair pairing attempt. On Google TV it first tries the accessory-pairing action `com.google.android.intent.action.CONNECT_INPUT`, then falls back to Bluetooth/device-picker/settings actions. It selects the configured speaker when visible by name or stored Bluetooth address, accepts the Bluetooth pair prompt, waits briefly, and checks A2DP state again.
+If the target speaker is no longer bonded/paired and Auto Connect is on, non-live automatic triggers and **Repair Pair Now** can start a repair pairing attempt. The live monitor does not start repair pairing by itself when the target is no longer paired; it records that repair is needed and waits for the configured backoff so it does not take over Settings while the user is fixing the device manually. On Google TV the repair flow first tries the accessory-pairing action `com.google.android.intent.action.CONNECT_INPUT`, then falls back to Bluetooth/device-picker/settings actions. It selects the configured speaker when visible by name or stored Bluetooth address, accepts the Bluetooth pair prompt, waits briefly, and checks A2DP state again.
 
-The live monitor uses public A2DP state checks only. It can bypass the long user cooldown so repair starts quickly after a disconnect, but it still requires Auto Connect, skips while playback is active when that safety control is enabled, avoids concurrent sessions, and throttles Settings launches.
+The live monitor uses public A2DP state checks only. It can bypass the long user cooldown so reconnect can start quickly after a disconnect, but it still requires Auto Connect, skips while playback is active when that safety control is enabled, avoids concurrent sessions, pauses while Google TV Settings is already foreground without an app-owned automation session, and throttles Settings launches.
 
 If a live-monitor reconnect attempt cannot find the configured speaker or cannot confirm connection after clicking the target row, the app backs off before trying again. The backoff uses the configured Cooldown value, with a 2 minute minimum if Cooldown is set to 0, but it allows a guarded live-monitor probe about every 30 seconds during that window so a speaker power-cycle can recover without waiting the full cooldown. Manual **Connect Now** and **Repair Pair Now** still run immediately.
 
@@ -110,7 +110,7 @@ When the target speaker appears disconnected, the app opens Bluetooth Settings a
 - retries up to the configured max retry count;
 - returns to Home after success or failure.
 
-If Google TV opens an unrelated Settings area such as Apps / Security / Play Protect / Developer options, the service does not click or scroll that page. It reopens a fresh Settings home once, then fails with a visible reason if the destination is still wrong.
+If Google TV opens an unrelated Settings area such as Apps / Security / Play Protect / Developer options, the service does not click or scroll that page. Wrong-destination labels take priority over generic Bluetooth/Accessories side-navigation labels, so a Developer options page is rejected even when a Settings side nav also contains Remotes & Accessories. It reopens a fresh Settings home once, then fails with a visible reason if the destination is still wrong.
 
 The Accessibility Service also watches live windows for a Bluetooth pairing prompt. It will press `Pair`, `Pair device`, `จับคู่`, or `จับคู่อุปกรณ์` only when:
 
@@ -128,7 +128,7 @@ Explicit **Repair Pair Now** sessions use the same target-name and Wi-Fi/ADB gua
 - **Auto Connect On/Off** gates automatic attempts.
 - **Skip while playback is active** uses `AudioManager.isMusicActive()` as best-effort detection.
 - **Max retry count** limits Accessibility retries.
-- **Cooldown** prevents aggressive app-open, boot, screen-on, and periodic loops. The Accessibility live monitor uses a shorter internal throttle so repair can start quickly after a disconnect.
+- **Cooldown** prevents aggressive app-open, boot, screen-on, and periodic loops. The Accessibility live monitor uses a shorter internal throttle so reconnect can start quickly after a disconnect without starting repair pairing on its own.
 - **Periodic lightweight retry** is off by default and uses Android WorkManager minimum interval behavior.
 
 ## Known Limitations
@@ -138,7 +138,7 @@ Explicit **Repair Pair Now** sessions use the same target-name and Wi-Fi/ADB gua
 - Android may restrict background activity launches after boot on some builds.
 - Playback detection is best-effort and may not identify every video or audio session.
 - Repair pairing requires the speaker to be powered on, in range, and discoverable/pairing-ready. If Google TV cannot see the speaker in the pairing UI, the app cannot pair it.
-- For repair testing, you may forget/unpair the target speaker from Google TV Bluetooth settings, put the speaker into pairing mode, and confirm BT Speaker Keeper starts repair pairing automatically.
+- For repair testing, you may forget/unpair the target speaker from Google TV Bluetooth settings, put the speaker into pairing mode, and confirm **Repair Pair Now** starts guarded repair pairing. Live monitor should report that repair is needed without opening the repair flow itself.
 - Even after the app selects the right discovered device, pairing can still be canceled by Google TV or the speaker if the speaker is not ready, rejects bonding, exits pairing mode, or has a stale failed bond state.
 - Live Pair prompt handling is best-effort. It only accepts prompts that visibly include the configured speaker name; it intentionally ignores generic or Wi-Fi/ADB pairing prompts.
 - Direct silent A2DP reconnection is not guaranteed for normal sideload apps because Android exposes reliable public APIs for state checks, but not a supported universal public API for silently connecting an arbitrary A2DP sink.

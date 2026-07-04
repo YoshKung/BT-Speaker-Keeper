@@ -9,10 +9,11 @@ object ReconnectAutomationPlanner {
         return when (state) {
             SpeakerConnectionState.DISCONNECTED -> AutomationMode.CONNECT
             SpeakerConnectionState.TARGET_NOT_PAIRED -> {
-                if (autoConnectEnabled || trigger == TriggerSource.REPAIR_PAIR) {
-                    AutomationMode.PAIR_REPAIR
-                } else {
-                    null
+                when {
+                    trigger == TriggerSource.REPAIR_PAIR -> AutomationMode.PAIR_REPAIR
+                    trigger == TriggerSource.LIVE_MONITOR -> null
+                    autoConnectEnabled -> AutomationMode.PAIR_REPAIR
+                    else -> null
                 }
             }
 

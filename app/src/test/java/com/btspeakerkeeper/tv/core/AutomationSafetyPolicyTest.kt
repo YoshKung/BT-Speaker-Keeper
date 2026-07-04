@@ -71,6 +71,45 @@ class AutomationSafetyPolicyTest {
     }
 
     @Test
+    fun wrongDestinationWinsOverVisibleNavigationAllowlist() {
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = "การตั้งค่า รีโมตและอุปกรณ์เสริม เปิดใช้ตัวเลือกสำหรับนักพัฒนาแอป",
+            mode = AutomationMode.CONNECT,
+            targetName = "Demo Speaker",
+            targetAddress = "",
+        )
+
+        assertEquals(AutomationWindowKind.WRONG_DESTINATION, classification.kind)
+        assertEquals("Wrong Settings destination: Developer options", classification.reason)
+    }
+
+    @Test
+    fun wrongDestinationWinsOverTargetContext() {
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = "PHANTOM ตัวเลือกสำหรับนักพัฒนา การแก้ไขข้อบกพร่อง USB",
+            mode = AutomationMode.CONNECT,
+            targetName = "PHANTOM",
+            targetAddress = "",
+        )
+
+        assertEquals(AutomationWindowKind.WRONG_DESTINATION, classification.kind)
+        assertEquals("Wrong Settings destination: Developer options", classification.reason)
+    }
+
+    @Test
+    fun unsafeWirelessDebuggingWinsOverTargetAndNavigationContext() {
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText = "PHANTOM รีโมตและอุปกรณ์เสริม รหัสการจับคู่ Wi-Fi 123456 ที่อยู่ IP และพอร์ต 203.0.113.10:45678",
+            mode = AutomationMode.PAIR_REPAIR,
+            targetName = "PHANTOM",
+            targetAddress = "",
+        )
+
+        assertEquals(AutomationWindowKind.UNSAFE, classification.kind)
+        assertEquals("Unsafe window: Wireless debugging or ADB pairing screen", classification.reason)
+    }
+
+    @Test
     fun allowsSettingsHomeWhenBluetoothNavigationIsVisible() {
         val classification = AutomationSafetyPolicy.classifyAutomationWindow(
             windowText = "Settings Network & Internet Apps Remotes & Accessories",

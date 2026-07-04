@@ -12,6 +12,7 @@ import com.btspeakerkeeper.tv.core.ReconnectDecision
 import com.btspeakerkeeper.tv.core.ReconnectPolicy
 import com.btspeakerkeeper.tv.core.ReconnectRuntimeState
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
+import com.btspeakerkeeper.tv.core.SingleVisibleRepairFallbackPolicy
 import com.btspeakerkeeper.tv.core.TriggerSource
 import com.btspeakerkeeper.tv.data.AppPrefs
 
@@ -118,7 +119,10 @@ object ReconnectCoordinator {
                                     maxRetries = settings.maxRetryCount,
                                     trigger = trigger,
                                     mode = automationMode,
-                                    allowSingleVisibleDeviceRepair = trigger == TriggerSource.REPAIR_PAIR,
+                                    allowSingleVisibleDeviceRepair = SingleVisibleRepairFallbackPolicy.canUse(
+                                        requestedByManualRepair = trigger == TriggerSource.REPAIR_PAIR,
+                                        targetAddress = settings.targetDeviceAddress,
+                                    ),
                                 )
                                 if (automationMode == AutomationMode.PAIR_REPAIR) {
                                     SettingsLauncher.openPairAccessorySettings(appContext)
@@ -128,16 +132,37 @@ object ReconnectCoordinator {
                             }
 
                             null -> {
-                                prefs.recordFailure(
-                                    state = result.state,
-                                    message = result.message ?: result.state.displayName,
-                                )
+                                val message = if (
+                                    trigger == TriggerSource.LIVE_MONITOR &&
+                                    result.state == SpeakerConnectionState.TARGET_NOT_PAIRED
+                                ) {
+                                    recordLiveMonitorRepairSkipped(appContext, prefs)
+                                } else {
+                                    result.message ?: result.state.displayName
+                                }
+                                prefs.recordFailure(state = result.state, message = message)
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    private fun recordLiveMonitorRepairSkipped(appContext: Context, prefs: AppPrefs): String {
+        val reason = "Live monitor repair skipped: target not paired; use Repair Pair Now"
+        val backoff = prefs.recordLiveMonitorBackoff(
+            nowMillis = System.currentTimeMillis(),
+            cooldownMinutes = prefs.getSettings().cooldownMinutes,
+            reason = reason,
+        )
+        logDebug(
+            appContext,
+            "live monitor repair skipped backoffUntil=${backoff.backoffUntilMillis} " +
+                "nextProbeAfter=${backoff.nextProbeAfterMillis} " +
+                "failureCount=${backoff.failureCount}: $reason",
+        )
+        return reason
     }
 
     private fun logDebug(context: Context, message: String) {

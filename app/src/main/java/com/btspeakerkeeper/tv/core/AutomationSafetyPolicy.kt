@@ -39,6 +39,13 @@ object AutomationSafetyPolicy {
             return AutomationWindowClassification(AutomationWindowKind.UNSAFE, reason)
         }
 
+        if (AutomationTextMatcher.isWrongSettingsDestination(windowText)) {
+            return AutomationWindowClassification(
+                AutomationWindowKind.WRONG_DESTINATION,
+                wrongSettingsDestinationReason(windowText),
+            )
+        }
+
         if (hasTargetContext(windowText, targetName, targetAddress)) {
             return AutomationWindowClassification(AutomationWindowKind.TARGET_CONTEXT)
         }
@@ -49,13 +56,6 @@ object AutomationSafetyPolicy {
 
         if (AutomationTextMatcher.isSettingsHome(windowText)) {
             return AutomationWindowClassification(AutomationWindowKind.SETTINGS_HOME)
-        }
-
-        if (AutomationTextMatcher.isWrongSettingsDestination(windowText)) {
-            return AutomationWindowClassification(
-                AutomationWindowKind.WRONG_DESTINATION,
-                wrongSettingsDestinationReason(windowText),
-            )
         }
 
         return AutomationWindowClassification(AutomationWindowKind.NEUTRAL)

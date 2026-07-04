@@ -18,6 +18,51 @@ class ReconnectAutomationPlannerTest {
     }
 
     @Test
+    fun liveMonitorDoesNotStartPairRepairWhenTargetIsNotPaired() {
+        assertNull(
+            ReconnectAutomationPlanner.modeFor(
+                state = SpeakerConnectionState.TARGET_NOT_PAIRED,
+                trigger = TriggerSource.LIVE_MONITOR,
+                autoConnectEnabled = true,
+            ),
+        )
+    }
+
+    @Test
+    fun nonLiveAutomaticTriggersCanStartPairRepairWhenTargetIsNotPaired() {
+        val triggers = listOf(
+            TriggerSource.APP_OPEN,
+            TriggerSource.BOOT,
+            TriggerSource.SCREEN_ON,
+            TriggerSource.PERIODIC,
+        )
+
+        triggers.forEach { trigger ->
+            assertEquals(
+                "trigger=$trigger",
+                AutomationMode.PAIR_REPAIR,
+                ReconnectAutomationPlanner.modeFor(
+                    state = SpeakerConnectionState.TARGET_NOT_PAIRED,
+                    trigger = trigger,
+                    autoConnectEnabled = true,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun connectNowCanStartPairRepairWhenTargetIsNotPaired() {
+        assertEquals(
+            AutomationMode.PAIR_REPAIR,
+            ReconnectAutomationPlanner.modeFor(
+                state = SpeakerConnectionState.TARGET_NOT_PAIRED,
+                trigger = TriggerSource.MANUAL,
+                autoConnectEnabled = true,
+            ),
+        )
+    }
+
+    @Test
     fun doesNotStartPairRepairForAutomaticTriggerWhenAutoConnectIsOff() {
         assertNull(
             ReconnectAutomationPlanner.modeFor(

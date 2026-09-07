@@ -8,7 +8,9 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.btspeakerkeeper.tv.PairingAssistActivity
@@ -22,9 +24,12 @@ import com.btspeakerkeeper.tv.core.ConnectRecoveryForegroundAction
 import com.btspeakerkeeper.tv.core.ConnectRecoveryForegroundPolicy
 import com.btspeakerkeeper.tv.core.ConnectCandidateSelectionPolicy
 import com.btspeakerkeeper.tv.core.ConnectCandidateSignal
+import com.btspeakerkeeper.tv.core.ConnectAttempt
+import com.btspeakerkeeper.tv.core.ConnectPhase
+import com.btspeakerkeeper.tv.core.ConnectStep
 import com.btspeakerkeeper.tv.core.ConnectProgressRecoveryAction
 import com.btspeakerkeeper.tv.core.ConnectProgressRecoveryPolicy
-import com.btspeakerkeeper.tv.core.DetailConnectCoordinatePolicy
+import com.btspeakerkeeper.tv.core.VisibleConnectAction
 import com.btspeakerkeeper.tv.core.LivePairPromptGuard
 import com.btspeakerkeeper.tv.core.LiveMonitorForegroundGuard
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
@@ -35,6 +40,10 @@ import com.btspeakerkeeper.tv.core.TargetRowActivationPolicy
 import com.btspeakerkeeper.tv.core.TargetDeviceMatcher
 import com.btspeakerkeeper.tv.core.TriggerSource
 import com.btspeakerkeeper.tv.core.UiBounds
+import com.btspeakerkeeper.tv.core.SettingsNavigationScrollPolicy
+import com.btspeakerkeeper.tv.core.SettingsScrollCandidate
+import com.btspeakerkeeper.tv.core.SettingsWindowTextPolicy
+import com.btspeakerkeeper.tv.core.ConnectConfirmationPolicy
 import com.btspeakerkeeper.tv.control.PlaybackDetector
 import com.btspeakerkeeper.tv.control.ReconnectCoordinator
 import com.btspeakerkeeper.tv.control.SettingsLauncher
@@ -50,6 +59,9 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private var monitorCheckInProgress = false
     private var monitorCheckToken = 0
     private var connectedConfirmationSessionId: Long? = null
+    private var confirmationToken = 0L
+    private var sessionDeadline: Runnable? = null
+    private var deadlineSessionId: Long? = null
     private var lastMonitorReconnectAtMillis = 0L
     private var lastLivePairAcceptedAtMillis: Long? = null
     private var lastUserOwnedSettingsSkipLogAtMillis = 0L
@@ -57,6 +69,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         prefs = AppPrefs(this)
+        logDebug(null, "service connected; accessibility flags=${serviceInfo.flags}")
         scheduleProcess(500L)
         scheduleConnectionMonitor(2_000L)
     }
@@ -76,6 +89,8 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     override fun onDestroy() {
+        clearRuntimeWork()
+        monitorCheckToken++
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -111,11 +126,16 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private fun runConnectionMonitor() {
         val settings = prefs.getSettings()
         val status = prefs.getStatus()
+        if (status.automationActive || currentSession != null) {
+            // A Settings launch can produce no useful event. The monitor must
+            // still adopt the session, arm its deadline, and make progress.
+            scheduleProcess(0L)
+            scheduleConnectionMonitor()
+            return
+        }
         if (
             !settings.autoConnectEnabled ||
             SpeakerNameMatcher.normalizeName(settings.targetDeviceName).isEmpty() ||
-            status.automationActive ||
-            currentSession != null ||
             monitorCheckInProgress ||
             isPairingAssistVisible() ||
             (settings.skipWhilePlaybackActive && PlaybackDetector.isPlaybackActive(this))
@@ -190,9 +210,35 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun processActiveWindow() {
+        val session = currentSession ?: prefs.getAutomationSession()?.toRuntimeSession()
+        if (session != null) {
+            currentSession = session
+            if (session.connectAttempt.isExpired(SystemClock.elapsedRealtime())) {
+                finishFailure("Automation session timed out after 2 minutes")
+                return
+            }
+            armSessionDeadline(session)
+        }
         val root = rootInActiveWindow
+        if (session != null && session.mode == AutomationMode.CONNECT) {
+            // A system progress overlay can replace Settings after Connect. Keep checking
+            // A2DP without spending navigation retries or requiring the old button tree.
+            val unsafeReason = root?.let { AutomationSafetyPolicy.unsafeAutomationWindowReason(windowText(it)) }
+            if (unsafeReason != null) {
+                finishFailure(unsafeReason)
+                return
+            }
+            when (session.connectAttempt.nextStep(false, SystemClock.elapsedRealtime())) {
+                ConnectStep.CHECK_A2DP -> {
+                    if (root != null && acceptTargetConnectConfirmation(root, session)) return
+                    confirmTargetConnectedWithA2dp(session, TARGET_ROW_CLICK_A2DP_FAILURE_PREFIX)
+                    return
+                }
+                ConnectStep.WAIT_FOR_GESTURE -> return
+                else -> Unit
+            }
+        }
         if (root == null) {
-            val session = currentSession ?: prefs.getAutomationSession()?.toRuntimeSession()
             if (session != null) {
                 handleMissingAutomationWindow(session, "No active Settings window")
             }
@@ -203,8 +249,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             return
         }
 
-        val session = currentSession ?: prefs.getAutomationSession()?.toRuntimeSession() ?: return
-        currentSession = session
+        if (session == null) return
 
         if (!isAutomationWindowPackage(root.packageName)) {
             handleMissingAutomationWindow(session, "Waiting for Google TV Settings window", root.packageName)
@@ -256,30 +301,34 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun processConnect(root: AccessibilityNodeInfo, session: RuntimeSession) {
-        val connectNode = findConnectNodeInsideTargetContext(root, session)
-        if (connectNode != null && safeClickClickableNode(connectNode, session, "Connect in saved-device target context")) {
-            currentSession = session.copy(
-                targetClicked = true,
-                targetFocused = false,
-                targetClickCheckStartedAtMillis = System.currentTimeMillis(),
-            )
-            scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
-            return
-        }
-
-        if (session.targetClicked || session.targetFocused) {
-            if (session.targetClicked) {
-                confirmTargetConnectedWithA2dp(session, "Target row click not confirmed by A2DP")
-            } else {
-                if (tapDetailConnectCoordinateFallback(root, session)) {
+        val targetWindow = AutomationSafetyPolicy.hasTargetContext(windowText(root), session.targetName, session.targetAddress)
+        val connectNode = if (targetWindow) findConnectNodeInsideTargetContext(root, session) else null
+        when (session.connectAttempt.nextStep(connectNode != null, SystemClock.elapsedRealtime())) {
+            ConnectStep.EXPIRED -> {
+                finishFailure("Automation session timed out after 2 minutes")
+                return
+            }
+            ConnectStep.WAIT_FOR_GESTURE -> return
+            ConnectStep.CHECK_A2DP -> {
+                confirmTargetConnectedWithA2dp(session, TARGET_ROW_CLICK_A2DP_FAILURE_PREFIX)
+                return
+            }
+            ConnectStep.ACTIVATE -> {
+                if (connectNode != null && clickConnectAction(connectNode, session)) {
+                    recordConnectClick(session)
                     return
                 }
-                retryOrFinish(session.copy(targetFocused = false), "Connect skipped: target detail Connect not visible")
+                if (tapVerifiedConnectAction(session)) return
             }
+            ConnectStep.SELECT_TARGET -> Unit
+        }
+
+        if (session.targetFocused) {
+            retryOrFinish(session.copy(targetFocused = false), "Connect skipped: target detail Connect not visible")
             return
         }
 
-        if (!session.targetClicked && !session.targetFocused) {
+        if (targetWindow && !session.targetClicked && !session.targetFocused) {
             val targetNode = findTargetTextNode(root, session)
             if (targetNode != null) {
                 val targetRowNode = clickableNodeOrAncestor(targetNode) ?: focusableNodeOrAncestor(targetNode) ?: targetNode
@@ -309,13 +358,8 @@ class BtKeeperAccessibilityService : AccessibilityService() {
                     }
 
                     TargetRowActivationAction.CLICK_DIRECT_CONNECT -> {
-                        if (safeClickClickableNode(targetNode, session, "target row direct Connect")) {
-                            currentSession = session.copy(
-                                targetClicked = true,
-                                targetFocused = false,
-                                targetClickCheckStartedAtMillis = System.currentTimeMillis(),
-                            )
-                            scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
+                        if (clickConnectAction(targetNode, session)) {
+                            recordConnectClick(session)
                             return
                         }
                     }
@@ -375,6 +419,36 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         }
 
         retryOrFinish(session, "Target speaker or Connect button not found")
+    }
+
+    private fun recordConnectClick(session: RuntimeSession) {
+        if (!session.connectAttempt.recordClick(SystemClock.elapsedRealtime())) return
+        currentSession = session.copy(targetClicked = true, targetFocused = false)
+        scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
+    }
+
+    private fun armSessionDeadline(session: RuntimeSession) {
+        if (deadlineSessionId == session.id) return
+        sessionDeadline?.let(handler::removeCallbacks)
+        deadlineSessionId = session.id
+        val deadline = Runnable {
+            if (currentSession?.id == session.id) finishFailure("Automation session timed out after 2 minutes")
+        }
+        sessionDeadline = deadline
+        handler.postDelayed(deadline, session.connectAttempt.remainingMillis(SystemClock.elapsedRealtime()))
+    }
+
+    private fun invalidatePendingConfirmation() {
+        confirmationToken++
+        connectedConfirmationSessionId = null
+    }
+
+    private fun clearRuntimeWork() {
+        invalidatePendingConfirmation()
+        sessionDeadline?.let(handler::removeCallbacks)
+        sessionDeadline = null
+        deadlineSessionId = null
+        currentSession = null
     }
 
     private fun processPairRepair(root: AccessibilityNodeInfo, session: RuntimeSession) {
@@ -521,7 +595,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             "Pair prompt accepted for ${settings.targetDeviceName}",
         )
         prefs.clearAutomationSession()
-        currentSession = null
+        clearRuntimeWork()
         schedulePostPairReconnectCheck()
         scheduleProcess(2_000L)
         return true
@@ -569,33 +643,30 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         if (connectedConfirmationSessionId == session.id) {
             return
         }
-        val targetClickCheckStartedAt = if (failurePrefix == TARGET_ROW_CLICK_A2DP_FAILURE_PREFIX) {
-            session.targetClickCheckStartedAtMillis ?: System.currentTimeMillis()
-        } else {
-            null
-        }
-        if (targetClickCheckStartedAt != null && session.targetClickCheckStartedAtMillis == null) {
-            currentSession = session.copy(targetClickCheckStartedAtMillis = targetClickCheckStartedAt)
-        }
+        val checkToken = ++confirmationToken
         connectedConfirmationSessionId = session.id
         logDebug(session, "$failurePrefix; confirming A2DP state")
         BluetoothStateRepository(this).checkTargetState(session.targetName, session.targetAddress) { result ->
             handler.post {
-                if (connectedConfirmationSessionId == session.id) {
-                    connectedConfirmationSessionId = null
-                }
+                if (checkToken != confirmationToken) return@post
+                connectedConfirmationSessionId = null
                 val activeSession = currentSession
                 if (activeSession == null || activeSession.id != session.id) {
                     return@post
                 }
+                if (activeSession.connectAttempt.isExpired(SystemClock.elapsedRealtime())) {
+                    finishFailure("Automation session timed out after 2 minutes")
+                    return@post
+                }
                 if (result.state == SpeakerConnectionState.CONNECTED) {
                     finishSuccess()
-                } else if (targetClickCheckStartedAt != null) {
+                } else if (activeSession.mode == AutomationMode.CONNECT &&
+                    activeSession.connectAttempt.phase == ConnectPhase.WAITING_A2DP
+                ) {
                     handleConnectProgressResult(
                         session = activeSession,
                         state = result.state,
-                        startedAtMillis = targetClickCheckStartedAt,
-                        nowMillis = System.currentTimeMillis(),
+                        nowMillis = SystemClock.elapsedRealtime(),
                     )
                 } else {
                     retryOrFinish(
@@ -610,10 +681,10 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     private fun handleConnectProgressResult(
         session: RuntimeSession,
         state: SpeakerConnectionState,
-        startedAtMillis: Long,
         nowMillis: Long,
     ) {
-        val elapsedMillis = nowMillis - startedAtMillis
+        val elapsedMillis = session.connectAttempt.waitElapsed(nowMillis)
+        if (session.connectAttempt.canTryGesture(state, nowMillis) && tapVerifiedConnectAction(session)) return
         val action = ConnectProgressRecoveryPolicy.decide(
             retryCount = session.retryCount,
             maxRetries = session.maxRetries,
@@ -667,11 +738,12 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             return
         }
 
+        invalidatePendingConfirmation()
+        session.connectAttempt.beginRecovery()
         val nextSession = session.copy(
             retryCount = nextRetryCount,
             targetClicked = false,
             targetFocused = false,
-            targetClickCheckStartedAtMillis = null,
             navigationClicked = false,
             navigationScrollCount = 0,
             connectBackRecoveryCount = if (action == ConnectProgressRecoveryAction.BACK_AND_RETRY) {
@@ -731,11 +803,12 @@ class BtKeeperAccessibilityService : AccessibilityService() {
                     finishFailure(safeMessage)
                     return
                 }
+                invalidatePendingConfirmation()
+                session.connectAttempt.beginRecovery()
                 val nextSession = session.copy(
                     retryCount = nextRetryCount,
                     targetClicked = false,
                     targetFocused = false,
-                    targetClickCheckStartedAtMillis = null,
                     navigationClicked = false,
                     navigationScrollCount = 0,
                     connectFreshRelaunchCount = session.connectFreshRelaunchCount + 1,
@@ -779,11 +852,16 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         }
 
         val recoveryMessage = "$safeMessage; reopening fresh Settings home"
+        invalidatePendingConfirmation()
+        session.connectAttempt.beginRecovery()
         logDebug(session, recoveryMessage)
         prefs.recordState(SpeakerConnectionState.AUTOMATION_STARTED, recoveryMessage)
         currentSession = session.copy(
             wrongDestinationRecoveryAttempted = true,
             navigationClicked = false,
+            targetClicked = false,
+            targetFocused = false,
+            navigationScrollCount = 0,
         )
         SettingsLauncher.openFreshSettingsHome(this)
         scheduleProcess(1_500L)
@@ -800,15 +878,14 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun finishSuccess() {
-        connectedConfirmationSessionId = null
+        logDebug(currentSession, "Target A2DP connected; returning Home")
         prefs.recordSuccess(System.currentTimeMillis())
         prefs.clearAutomationSession()
-        currentSession = null
+        clearRuntimeWork()
         performGlobalAction(GLOBAL_ACTION_HOME)
     }
 
     private fun finishFailure(message: String) {
-        connectedConfirmationSessionId = null
         val session = currentSession
         val safeMessage = AutomationSafetyPolicy.redactSensitiveText(message)
         if (session?.trigger == TriggerSource.LIVE_MONITOR) {
@@ -827,7 +904,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             prefs.recordFailure(SpeakerConnectionState.ERROR, safeMessage)
         }
         prefs.clearAutomationSession()
-        currentSession = null
+        clearRuntimeWork()
         performGlobalAction(GLOBAL_ACTION_HOME)
     }
 
@@ -835,7 +912,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val assistMessage = "$message Press and hold the speaker Bluetooth/Pair button, then wait for retry."
         prefs.recordFailure(SpeakerConnectionState.ERROR, assistMessage)
         prefs.clearAutomationSession()
-        currentSession = null
+        clearRuntimeWork()
         val intent = Intent(this, PairingAssistActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             .putExtra(PairingAssistActivity.EXTRA_REASON, assistMessage)
@@ -880,21 +957,29 @@ class BtKeeperAccessibilityService : AccessibilityService() {
 
     private fun windowText(root: AccessibilityNodeInfo): String {
         val builder = StringBuilder()
+        val navigation = StringBuilder()
+        val screen = displayBounds()
         traverse(root) { node ->
+            if (!node.isVisibleToUser) return@traverse
             val text = nodeText(node)
             if (text.isNotBlank()) {
                 if (builder.isNotEmpty()) {
                     builder.append(' ')
                 }
                 builder.append(text)
+                val bounds = uiBounds(node)
+                if (bounds.width > 0 && bounds.left >= screen.left && bounds.right <= screen.left + screen.width / 2) {
+                    if (navigation.isNotEmpty()) navigation.append(' ')
+                    navigation.append(text)
+                }
             }
         }
-        return builder.toString()
+        return SettingsWindowTextPolicy.choose(builder.toString(), navigation.toString())
     }
 
     private fun findTargetTextNode(root: AccessibilityNodeInfo, session: RuntimeSession): AccessibilityNodeInfo? {
         return findFirstNode(root) { node ->
-            AutomationSafetyPolicy.hasTargetContext(
+            node.isVisibleToUser && node.isEnabled && AutomationSafetyPolicy.hasTargetContext(
                 contextText = nodeText(node),
                 targetName = session.targetName,
                 targetAddress = session.targetAddress,
@@ -906,11 +991,22 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         root: AccessibilityNodeInfo,
         session: RuntimeSession,
     ): AccessibilityNodeInfo? {
-        val connectNodes = mutableListOf<AccessibilityNodeInfo>()
+        val found = mutableListOf<AccessibilityNodeInfo>()
         traverse(root) { node ->
-            if (AutomationTextMatcher.isConnectAction(nodeText(node))) {
-                connectNodes.add(node)
+            if (node.isVisibleToUser && node.isEnabled && connectLabel(node) != null) {
+                found.add(node)
             }
+        }
+        val leafLabels = found.filter { node ->
+            (0 until node.childCount).none { index ->
+                node.getChild(index)?.let { child ->
+                    findFirstNode(child) { it.isVisibleToUser && connectLabel(it) != null } != null
+                } == true
+            }
+        }
+        val connectNodes = leafLabels.distinctBy { node ->
+            val action = safeConnectContainer(node) ?: node
+            "${node.windowId}:${uiBounds(action)}"
         }
         if (connectNodes.isEmpty()) {
             return null
@@ -919,7 +1015,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val signals = connectNodes.map { node ->
             ConnectCandidateSignal(
                 hasTargetAncestor = hasTargetContextInAncestors(node, root, session),
-                hasClickableAction = clickableNodeOrAncestor(node) != null,
+                hasClickableAction = safeConnectContainer(node) != null,
             )
         }
         val selectedIndex = ConnectCandidateSelectionPolicy.chooseIndex(
@@ -1012,56 +1108,113 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         return clicked
     }
 
-    private fun tapDetailConnectCoordinateFallback(
-        root: AccessibilityNodeInfo,
-        session: RuntimeSession,
-    ): Boolean {
-        val targetRowNode = findFocusedTargetRowNode(root, session) ?: return false
-        val firstActionRow = findFirstNode(root) { node ->
-            AutomationTextMatcher.isRepairPairNavigationTarget(nodeText(node))
-        } ?: return false
-        val targetRowBounds = uiBounds(targetRowNode)
-        val firstActionRowBounds = uiBounds(firstActionRow)
-        val minimumCoordinateWidth = firstActionRowBounds.right + firstActionRowBounds.width + 1
-        val minimumCoordinateHeight = firstActionRowBounds.centerY + 1
-        val tapPoint = DetailConnectCoordinatePolicy.computeTapPoint(
-            targetRowFocused = nodeOrSubtreeIsFocused(targetRowNode),
-            hasTargetWindowContext = AutomationSafetyPolicy.hasTargetContext(
-                contextText = windowText(root),
-                targetName = session.targetName,
-                targetAddress = session.targetAddress,
-            ),
-            targetRowBounds = targetRowBounds,
-            firstActionRowBounds = firstActionRowBounds,
-            screenWidth = resources.displayMetrics.widthPixels.coerceAtLeast(minimumCoordinateWidth),
-            screenHeight = resources.displayMetrics.heightPixels.coerceAtLeast(minimumCoordinateHeight),
-        ) ?: return false
+    private fun clickConnectAction(node: AccessibilityNodeInfo, session: RuntimeSession): Boolean {
+        val clickable = safeConnectContainer(node) ?: return false
+        return safeClickClickableNode(clickable, session, "Connect in saved-device target context")
+    }
 
-        val path = Path().apply {
-            moveTo(tapPoint.x.toFloat(), tapPoint.y.toFloat())
+    private fun connectLabel(node: AccessibilityNodeInfo): CharSequence? =
+        listOf(node.text, node.contentDescription).firstOrNull(AutomationTextMatcher::isConnectAction)
+
+    private fun acceptTargetConnectConfirmation(root: AccessibilityNodeInfo, session: RuntimeSession): Boolean {
+        val labels = mutableListOf<String>()
+        val affirmative = mutableListOf<AccessibilityNodeInfo>()
+        traverse(root) { node ->
+            if (node.isVisibleToUser) {
+                node.text?.toString()?.takeIf(String::isNotBlank)?.let(labels::add)
+                if (node.isEnabled && ConnectConfirmationPolicy.isAffirmative(node.text)) affirmative.add(node)
+            }
         }
+        if (!ConnectConfirmationPolicy.allows(root.packageName.toString(), labels, session.targetName,
+                session.connectAttempt.phase == ConnectPhase.WAITING_A2DP)) return false
+        val label = affirmative.singleOrNull() ?: return false
+        val action = clickableNodeOrAncestor(label) ?: return false
+        if (!action.isVisibleToUser) return false
+        val actionLabels = mutableListOf<String>()
+        traverse(action) { node ->
+            if (node.isVisibleToUser) node.text?.toString()?.takeIf(String::isNotBlank)?.let(actionLabels::add)
+        }
+        if (actionLabels.isEmpty() || actionLabels.any { !ConnectConfirmationPolicy.isAffirmative(it) }) return false
+        if (!session.connectAttempt.claimConfirmation(SystemClock.elapsedRealtime())) return false
+        val clicked = action.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        logDebug(session, "target Connect confirmation click=$clicked; checking A2DP")
+        scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
+        return true
+    }
+
+    private fun safeConnectContainer(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (!node.isVisibleToUser || !node.isEnabled) return null
+        val clickable = clickableNodeOrAncestor(node) ?: return null
+        if (!clickable.isVisibleToUser) return null
+        val labels = mutableListOf<String>()
+        traverse(clickable) { child ->
+            if (child.isVisibleToUser) {
+                child.text?.toString()?.let(labels::add)
+                child.contentDescription?.toString()?.let(labels::add)
+            }
+        }
+        return clickable.takeIf { VisibleConnectAction.isSafeContainer(labels) }
+    }
+
+    private fun tapVerifiedConnectAction(session: RuntimeSession): Boolean {
+        // Re-read the current window: the old node may belong to a different detail pane now.
+        if (currentSession?.id != session.id) return false
+        val root = rootInActiveWindow ?: return false
+        if (!isAutomationWindowPackage(root.packageName)) return false
+        val classification = AutomationSafetyPolicy.classifyAutomationWindow(
+            windowText(root), session.mode, session.targetName, session.targetAddress,
+        )
+        if (classification.kind != AutomationWindowKind.TARGET_CONTEXT) return false
+        val node = findConnectNodeInsideTargetContext(root, session) ?: return false
+        val point = VisibleConnectAction.tapPoint(
+            label = connectLabel(node),
+            visible = node.isVisibleToUser,
+            enabled = node.isEnabled,
+            hasTargetContext = true,
+            safeWindow = true,
+            actionBounds = uiBounds(node),
+            screenBounds = displayBounds(),
+        ) ?: return false
+        val gestureToken = session.connectAttempt.beginGesture(SystemClock.elapsedRealtime()) ?: return false
+        invalidatePendingConfirmation()
+        currentSession = session.copy(targetClicked = true, targetFocused = false)
+        val path = Path().apply { moveTo(point.x.toFloat(), point.y.toFloat()) }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, COORDINATE_TAP_DURATION_MILLIS))
             .build()
-        val dispatched = dispatchGesture(gesture, null, null)
-        if (!dispatched) {
-            logDebug(session, "coordinate Connect tap rejected by Accessibility dispatch")
-            return false
+        lateinit var callbackTimeout: Runnable
+        fun complete(completed: Boolean) {
+            if (currentSession?.id != session.id) return
+            if (!session.connectAttempt.finishGesture(gestureToken, completed, SystemClock.elapsedRealtime())) return
+            handler.removeCallbacks(callbackTimeout)
+            logDebug(session, if (completed) "Connect gesture completed; checking A2DP" else "Connect gesture cancelled or rejected")
+            scheduleProcess(if (completed) POST_CONNECT_CLICK_CHECK_DELAY_MILLIS else 0L)
         }
-
-        currentSession = session.copy(
-            targetClicked = true,
-            targetFocused = false,
-            targetClickCheckStartedAtMillis = System.currentTimeMillis(),
-        )
-        logDebug(
-            currentSession,
-            "coordinate Connect tap dispatched x=${tapPoint.x} y=${tapPoint.y} " +
-                "targetBounds=$targetRowBounds actionBounds=$firstActionRowBounds",
-            subtreeText(targetRowNode),
-        )
-        scheduleProcess(POST_CONNECT_CLICK_CHECK_DELAY_MILLIS)
+        callbackTimeout = Runnable { complete(false) }
+        handler.postDelayed(callbackTimeout, MONITOR_CHECK_TIMEOUT_MILLIS)
+        val dispatched = try {
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription) = complete(true)
+                override fun onCancelled(gestureDescription: GestureDescription) = complete(false)
+            }, handler)
+        } catch (exception: RuntimeException) {
+            false
+        }
+        if (!dispatched) complete(false)
+        logDebug(session, "Connect gesture dispatch=$dispatched; using verified action bounds")
         return true
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayBounds(): UiBounds {
+        val windowManager = getSystemService(WindowManager::class.java)
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val bounds = windowManager.maximumWindowMetrics.bounds
+            return UiBounds(bounds.left, bounds.top, bounds.right, bounds.bottom)
+        }
+        val metrics = android.util.DisplayMetrics()
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        return UiBounds(0, 0, metrics.widthPixels, metrics.heightPixels)
     }
 
     private fun safeFocusNode(
@@ -1210,8 +1363,13 @@ class BtKeeperAccessibilityService : AccessibilityService() {
     }
 
     private fun scrollForward(root: AccessibilityNodeInfo): Boolean {
-        val scrollable = findFirstNode(root) { node -> node.isScrollable }
-        return scrollable?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true
+        val nodes = mutableListOf<AccessibilityNodeInfo>()
+        traverse(root) { node -> nodes.add(node) }
+        val candidates = nodes.map { node ->
+            SettingsScrollCandidate(node.className.toString(), uiBounds(node), node.isVisibleToUser, node.isScrollable)
+        }
+        val index = SettingsNavigationScrollPolicy.chooseIndex(candidates, displayBounds()) ?: return false
+        return nodes[index].performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
     }
 
     private fun focusedNodeText(root: AccessibilityNodeInfo): String {
@@ -1341,6 +1499,9 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             trigger = trigger,
             mode = mode,
             allowSingleVisibleDeviceRepair = allowSingleVisibleDeviceRepair,
+            connectAttempt = ConnectAttempt(
+                SystemClock.elapsedRealtime() - (System.currentTimeMillis() - id).coerceAtLeast(0L),
+            ),
         )
     }
 
@@ -1364,6 +1525,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val trigger: TriggerSource,
         val mode: AutomationMode,
         val allowSingleVisibleDeviceRepair: Boolean,
+        val connectAttempt: ConnectAttempt,
         val retryCount: Int = 0,
         val targetClicked: Boolean = false,
         val targetFocused: Boolean = false,
@@ -1371,7 +1533,6 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val navigationScrollCount: Int = 0,
         val wrongDestinationRecoveryAttempted: Boolean = false,
         val repairDeviceName: String = "",
-        val targetClickCheckStartedAtMillis: Long? = null,
         val connectBackRecoveryCount: Int = 0,
         val connectFreshRelaunchCount: Int = 0,
     )

@@ -11,23 +11,15 @@ object ConnectCandidateSelectionPolicy {
         hasTargetWindowContext: Boolean,
         targetActivated: Boolean,
     ): Int? {
-        val ancestorClickableIndex = candidates.indexOfFirst { candidate ->
-            candidate.hasTargetAncestor && candidate.hasClickableAction
-        }
-        if (ancestorClickableIndex >= 0) {
-            return ancestorClickableIndex
-        }
-
-        val ancestorIndex = candidates.indexOfFirst { candidate -> candidate.hasTargetAncestor }
-        if (ancestorIndex >= 0) {
-            return ancestorIndex
-        }
+        val ancestorIndices = candidates.indices.filter { candidates[it].hasTargetAncestor }
+        if (ancestorIndices.isNotEmpty()) return ancestorIndices.singleOrNull()
 
         if (!targetActivated || !hasTargetWindowContext) {
             return null
         }
 
-        val clickableIndex = candidates.indexOfFirst { candidate -> candidate.hasClickableAction }
-        return clickableIndex.takeIf { it >= 0 } ?: candidates.indices.firstOrNull()
+        // Duplicate accessibility nodes for the same action are collapsed by the caller.
+        // Separate remaining actions are ambiguous, even if one happens to be clickable.
+        return candidates.indices.singleOrNull()
     }
 }

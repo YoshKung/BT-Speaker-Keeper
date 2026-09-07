@@ -20,7 +20,7 @@ class ConnectCandidateSelectionPolicyTest {
     }
 
     @Test
-    fun selectsFirstClickableDuplicateConnectAfterTargetActivation() {
+    fun rejectsAmbiguousConnectActionsAfterTargetActivation() {
         val selected = ConnectCandidateSelectionPolicy.chooseIndex(
             candidates = listOf(
                 ConnectCandidateSignal(hasTargetAncestor = false, hasClickableAction = true),
@@ -30,7 +30,7 @@ class ConnectCandidateSelectionPolicyTest {
             targetActivated = true,
         )
 
-        assertEquals(0, selected)
+        assertNull(selected)
     }
 
     @Test

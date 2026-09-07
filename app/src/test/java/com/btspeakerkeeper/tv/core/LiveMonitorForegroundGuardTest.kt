@@ -31,6 +31,7 @@ class LiveMonitorForegroundGuardTest {
             "com.android.settings",
             "com.android.tv.settings",
             "com.google.android.tv.settings",
+            "com.google.android.chromecast.chromecastservice",
         )
 
         settingsPackages.forEach { packageName ->

@@ -10,11 +10,15 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import com.btspeakerkeeper.tv.core.ConnectedSpeakerSelection
 import com.btspeakerkeeper.tv.core.KnownBluetoothDevice
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
 import com.btspeakerkeeper.tv.core.SpeakerNameMatcher
 import com.btspeakerkeeper.tv.core.TargetDeviceMatcher
+import com.btspeakerkeeper.tv.core.TimedResult
 
 class BluetoothStateRepository(private val context: Context) {
     private val appContext = context.applicationContext
@@ -51,27 +55,67 @@ class BluetoothStateRepository(private val context: Context) {
             return
         }
 
-        val connected = adapter.getProfileProxy(
+        val handler = Handler(Looper.getMainLooper())
+        lateinit var timeout: Runnable
+        val completion = TimedResult(
+            startedAtMillis = SystemClock.elapsedRealtime(),
+            timeoutMillis = 4_000L,
+            timeoutValue = BluetoothCheckResult(
+                SpeakerConnectionState.PROFILE_UNAVAILABLE,
+                message = "A2DP state check timed out",
+            ),
+        ) { result ->
+            handler.removeCallbacks(timeout)
+            callback(result)
+        }
+        timeout = Runnable { completion.expire(SystemClock.elapsedRealtime()) }
+        handler.postDelayed(timeout, 4_000L)
+
+        val connected = try { adapter.getProfileProxy(
             appContext,
             object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                    if (profile != BluetoothProfile.A2DP) {
-                        callback(BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE, deviceName = safeName(targetDevice)))
-                        return
+                    handler.post {
+                        val result = try {
+                            if (profile == BluetoothProfile.A2DP && proxy is BluetoothA2dp) {
+                                checkWithA2dp(proxy, targetDevice)
+                            } else {
+                                BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE)
+                            }
+                        } finally {
+                            // Even a proxy arriving after timeout must be released.
+                            runCatching { adapter.closeProfileProxy(profile, proxy) }
+                        }
+                        completion.complete(result, SystemClock.elapsedRealtime())
                     }
-
-                    val result = checkWithA2dp(proxy as BluetoothA2dp, targetDevice)
-                    adapter.closeProfileProxy(BluetoothProfile.A2DP, proxy)
-                    callback(result)
                 }
 
-                override fun onServiceDisconnected(profile: Int) = Unit
+                override fun onServiceDisconnected(profile: Int) {
+                    handler.post {
+                        completion.complete(
+                            BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE),
+                            SystemClock.elapsedRealtime(),
+                        )
+                    }
+                }
             },
             BluetoothProfile.A2DP,
-        )
+        ) } catch (exception: RuntimeException) {
+            completion.complete(
+                BluetoothCheckResult(
+                    if (exception is SecurityException) SpeakerConnectionState.MISSING_PERMISSION else SpeakerConnectionState.ERROR,
+                    message = "A2DP state check could not start",
+                ),
+                SystemClock.elapsedRealtime(),
+            )
+            false
+        }
 
         if (!connected) {
-            callback(BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE, deviceName = safeName(targetDevice)))
+            completion.complete(
+                BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE, deviceName = safeName(targetDevice)),
+                SystemClock.elapsedRealtime(),
+            )
         }
     }
 

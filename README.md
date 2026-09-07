@@ -104,11 +104,25 @@ When the target speaker appears disconnected, the app opens Bluetooth Settings a
 - searches the active window tree for the configured speaker name;
 - searches for `Connect` or `เชื่อมต่อ`;
 - clicks the Connect action first when it is in the configured speaker context, including saved-device pages where the speaker name is text-only and the action is a sibling button;
-- otherwise clicks the speaker row or clickable parent, then gives Google TV up to about 12 seconds to connect if that row click opens a progress state;
+- otherwise focuses the configured speaker row to expose its detail Connect action, then activates only a verified Connect action;
 - if that saved-device progress state gets stuck, backs out once, resets the click state, and retries the target-context Connect search; if needed it then relaunches fresh Settings once before failing/backing off;
 - detects `Connected` or `เชื่อมต่อแล้ว` only when it is not a disconnected label such as `เลิกเชื่อมต่อแล้ว`, then confirms the target is connected through public A2DP state before treating automation as successful;
 - retries up to the configured max retry count;
 - returns to Home after success or failure.
+
+### Connect wait recovery (v0.16)
+
+On two-pane Google TV Settings, the service includes otherwise omitted accessibility views so the saved-speaker Connect preview can be read. It scrolls the left vertical navigation list, ignores unrelated Apps/Security preview content when the left pane is verified as Settings home, and finishes opening the device-list route before selecting a speaker.
+
+Some Chromecast builds show a second “Connect to <speaker>” / “เชื่อมต่อกับ <speaker>” Yes/No confirmation. During an app-owned Connect attempt, the service accepts only that exact target confirmation from the observed system confirmation package. It does not accept generic Yes dialogs. Live monitor also pauses while this confirmation belongs to the user.
+
+After activating Connect, the service checks public A2DP state before considering another click. A Connect label that stays visible, or repeated Accessibility events, cannot restart the wait timer. The normal wait is 12 seconds, extended to 30 seconds only while A2DP reports Connecting.
+
+If the target remains Disconnected after 12 seconds, the service may try one gesture per session at the center of a freshly read, visible, enabled Connect label in the target context. A rejected Accessibility click may use the same fallback immediately. Gestures use the actual display bounds, never a guessed right-pane position. Their completed/cancelled callbacks are observed, with a 4-second callback deadline. A gesture acknowledgement is not connection success: public A2DP must still confirm Connected.
+
+Connect candidates representing the same action are deduplicated; multiple distinct eligible actions are rejected as ambiguous. Clickable ancestors containing Rename, Forget, or Disconnect actions are not activated. If Settings does not expose a safe Connect label, the service reports a bounded failure instead of guessing a location.
+
+After the fallback, the existing one-Back/one-fresh-Settings recovery and configured retry budget apply. Each session has an independent 2-minute deadline, including when no useful window events arrive. Target A2DP checks time out after 4 seconds and deliver only one result; duplicate and late callbacks cannot overwrite a timeout or resume a finished session.
 
 If Google TV opens an unrelated Settings area such as Apps / Security / Play Protect / Developer options, the service does not click or scroll that page. Wrong-destination labels take priority over generic Bluetooth/Accessories side-navigation labels, so a Developer options page is rejected even when a Settings side nav also contains Remotes & Accessories. It reopens a fresh Settings home once, then fails with a visible reason if the destination is still wrong.
 

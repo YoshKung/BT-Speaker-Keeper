@@ -44,6 +44,10 @@ import com.btspeakerkeeper.tv.core.SettingsNavigationScrollPolicy
 import com.btspeakerkeeper.tv.core.SettingsScrollCandidate
 import com.btspeakerkeeper.tv.core.SettingsWindowTextPolicy
 import com.btspeakerkeeper.tv.core.ConnectConfirmationPolicy
+import com.btspeakerkeeper.tv.core.SavedDeviceDetailsAttempt
+import com.btspeakerkeeper.tv.core.SavedDeviceRow
+import com.btspeakerkeeper.tv.core.LiveMonitorAction
+import com.btspeakerkeeper.tv.core.LiveMonitorStatePolicy
 import com.btspeakerkeeper.tv.control.PlaybackDetector
 import com.btspeakerkeeper.tv.control.ReconnectCoordinator
 import com.btspeakerkeeper.tv.control.SettingsLauncher
@@ -144,12 +148,6 @@ class BtKeeperAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (isUserOwnedSettingsWindowVisible()) {
-            logLiveMonitorSkipIfNeeded(LiveMonitorForegroundGuard.USER_OWNED_SETTINGS_REASON)
-            scheduleConnectionMonitor()
-            return
-        }
-
         monitorCheckInProgress = true
         val checkToken = ++monitorCheckToken
         handler.postDelayed(
@@ -170,17 +168,35 @@ class BtKeeperAccessibilityService : AccessibilityService() {
                     return@post
                 }
                 monitorCheckInProgress = false
-                if (shouldReconnectFromMonitor(result.state)) {
-                    triggerLiveMonitorReconnect()
+                val latestSettings = prefs.getSettings()
+                if (!latestSettings.autoConnectEnabled || latestSettings.targetDeviceName != settings.targetDeviceName ||
+                    latestSettings.targetDeviceAddress != settings.targetDeviceAddress
+                ) {
+                    scheduleConnectionMonitor()
+                    return@post
+                }
+                val latestStatus = prefs.getStatus()
+                val userOwnsSettings = isUserOwnedSettingsWindowVisible()
+                val action = LiveMonitorStatePolicy.decide(
+                    state = result.state,
+                    automationActive = currentSession != null || latestStatus.automationActive,
+                    userOwnsSettings = userOwnsSettings,
+                    needsConnectedRefresh = latestStatus.lastConnectionState != SpeakerConnectionState.CONNECTED.displayName ||
+                        latestStatus.lastError.isNotEmpty() || prefs.getLiveMonitorBackoffUntilMillis() != null,
+                )
+                when (action) {
+                    LiveMonitorAction.UPDATE_CONNECTED -> {
+                        prefs.recordSuccess(System.currentTimeMillis())
+                        logDebug(null, "monitor confirmed target A2DP Connected; status reconciled without navigation")
+                    }
+                    LiveMonitorAction.RECONNECT -> triggerLiveMonitorReconnect()
+                    LiveMonitorAction.IGNORE -> if (userOwnsSettings) {
+                        logLiveMonitorSkipIfNeeded(LiveMonitorForegroundGuard.USER_OWNED_SETTINGS_REASON)
+                    }
                 }
                 scheduleConnectionMonitor()
             }
         }
-    }
-
-    private fun shouldReconnectFromMonitor(state: SpeakerConnectionState): Boolean {
-        return state == SpeakerConnectionState.DISCONNECTED ||
-            state == SpeakerConnectionState.TARGET_NOT_PAIRED
     }
 
     private fun triggerLiveMonitorReconnect() {
@@ -324,6 +340,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         }
 
         if (session.targetFocused) {
+            if (openSavedTargetDetails(root, session)) return
             retryOrFinish(session.copy(targetFocused = false), "Connect skipped: target detail Connect not visible")
             return
         }
@@ -419,6 +436,27 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         }
 
         retryOrFinish(session, "Target speaker or Connect button not found")
+    }
+
+    private fun openSavedTargetDetails(root: AccessibilityNodeInfo, session: RuntimeSession): Boolean {
+        val nodes = mutableListOf<AccessibilityNodeInfo>()
+        traverse(root) { node -> if (node.isClickable && node.isVisibleToUser) nodes.add(node) }
+        val rows = nodes.map { node ->
+            val labels = mutableListOf<String>()
+            traverse(node) { child ->
+                if (child.isVisibleToUser) {
+                    child.text?.toString()?.takeIf(String::isNotBlank)?.let(labels::add)
+                    child.contentDescription?.toString()?.takeIf(String::isNotBlank)?.let(labels::add)
+                }
+            }
+            SavedDeviceRow(labels, uiBounds(node), nodeOrSubtreeIsFocused(node), node.isVisibleToUser, node.isEnabled, node.isClickable)
+        }
+        val index = session.detailsAttempt.takeRow(rows, session.targetName, session.targetAddress, displayBounds()) ?: return false
+        safeClickClickableNode(nodes[index], session, "saved target details navigation")
+        // Opening details is navigation, not a Connect activation or proof of success.
+        // Keep this attempt object across retries so repeated events cannot click it again.
+        scheduleProcess(POST_TARGET_FOCUS_CHECK_DELAY_MILLIS)
+        return true
     }
 
     private fun recordConnectClick(session: RuntimeSession) {
@@ -1526,6 +1564,7 @@ class BtKeeperAccessibilityService : AccessibilityService() {
         val mode: AutomationMode,
         val allowSingleVisibleDeviceRepair: Boolean,
         val connectAttempt: ConnectAttempt,
+        val detailsAttempt: SavedDeviceDetailsAttempt = SavedDeviceDetailsAttempt(),
         val retryCount: Int = 0,
         val targetClicked: Boolean = false,
         val targetFocused: Boolean = false,

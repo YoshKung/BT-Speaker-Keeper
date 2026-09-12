@@ -17,7 +17,7 @@ import com.btspeakerkeeper.tv.core.ConnectedSpeakerSelection
 import com.btspeakerkeeper.tv.core.KnownBluetoothDevice
 import com.btspeakerkeeper.tv.core.SpeakerConnectionState
 import com.btspeakerkeeper.tv.core.SpeakerNameMatcher
-import com.btspeakerkeeper.tv.core.TargetDeviceMatcher
+import com.btspeakerkeeper.tv.core.TargetConnectionLookup
 import com.btspeakerkeeper.tv.core.TimedResult
 
 class BluetoothStateRepository(private val context: Context) {
@@ -49,12 +49,6 @@ class BluetoothStateRepository(private val context: Context) {
             return
         }
 
-        val targetDevice = findBondedTarget(adapter, targetName, targetAddress)
-        if (targetDevice == null) {
-            callback(BluetoothCheckResult(SpeakerConnectionState.TARGET_NOT_PAIRED, message = "Target speaker is not paired"))
-            return
-        }
-
         val handler = Handler(Looper.getMainLooper())
         lateinit var timeout: Runnable
         val completion = TimedResult(
@@ -78,7 +72,7 @@ class BluetoothStateRepository(private val context: Context) {
                     handler.post {
                         val result = try {
                             if (profile == BluetoothProfile.A2DP && proxy is BluetoothA2dp) {
-                                checkWithA2dp(proxy, targetDevice)
+                                checkWithA2dp(proxy, adapter, targetName, targetAddress)
                             } else {
                                 BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE)
                             }
@@ -113,7 +107,7 @@ class BluetoothStateRepository(private val context: Context) {
 
         if (!connected) {
             completion.complete(
-                BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE, deviceName = safeName(targetDevice)),
+                BluetoothCheckResult(SpeakerConnectionState.PROFILE_UNAVAILABLE, deviceName = targetName),
                 SystemClock.elapsedRealtime(),
             )
         }
@@ -180,49 +174,47 @@ class BluetoothStateRepository(private val context: Context) {
         targetName: String,
         targetAddress: String,
     ): BluetoothDevice? {
-        return try {
-            adapter.bondedDevices.firstOrNull { device ->
-                TargetDeviceMatcher.addressesEqual(safeAddress(device), targetAddress) ||
-                    SpeakerNameMatcher.matchesExactConfiguredName(safeName(device), targetName)
-            }
-        } catch (securityException: SecurityException) {
-            null
-        }
+        val devices = adapter.bondedDevices.toList()
+        val index = TargetConnectionLookup.targetIndex(devices.map(::safeKnownDevice), targetName, targetAddress)
+        return index?.let(devices::get)
     }
 
     @SuppressLint("MissingPermission")
-    private fun checkWithA2dp(a2dp: BluetoothA2dp, targetDevice: BluetoothDevice): BluetoothCheckResult {
+    private fun checkWithA2dp(
+        a2dp: BluetoothA2dp,
+        adapter: BluetoothAdapter,
+        targetName: String,
+        targetAddress: String,
+    ): BluetoothCheckResult {
         return try {
-            val connectedDevices = a2dp.connectedDevices
-            val targetConnected = connectedDevices.any { device ->
-                TargetDeviceMatcher.addressesEqual(safeAddress(device), safeAddress(targetDevice)) ||
-                    SpeakerNameMatcher.matchesExactConfiguredName(safeName(device), safeName(targetDevice))
-            }
-            val state = if (targetConnected) {
-                BluetoothProfile.STATE_CONNECTED
-            } else {
-                a2dp.getConnectionState(targetDevice)
-            }
-
-            BluetoothCheckResult(
-                state = when (state) {
+            // A live A2DP connection can outlast a missing/transient bond record.
+            // Check the exact configured identity before consulting bonded devices.
+            val state = TargetConnectionLookup.resolve(
+                a2dp.connectedDevices.map(::safeKnownDevice), targetName, targetAddress,
+            ) {
+                val targetDevice = findBondedTarget(adapter, targetName, targetAddress)
+                    ?: return@resolve SpeakerConnectionState.TARGET_NOT_PAIRED
+                when (a2dp.getConnectionState(targetDevice)) {
                     BluetoothProfile.STATE_CONNECTED -> SpeakerConnectionState.CONNECTED
                     BluetoothProfile.STATE_CONNECTING -> SpeakerConnectionState.CONNECTING
                     BluetoothProfile.STATE_DISCONNECTING -> SpeakerConnectionState.DISCONNECTING
                     else -> SpeakerConnectionState.DISCONNECTED
-                },
-                deviceName = safeName(targetDevice),
+                }
+            }
+            BluetoothCheckResult(
+                state = state,
+                deviceName = targetName,
             )
         } catch (securityException: SecurityException) {
             BluetoothCheckResult(
                 state = SpeakerConnectionState.MISSING_PERMISSION,
-                deviceName = safeName(targetDevice),
+                deviceName = targetName,
                 message = "Nearby Devices permission missing",
             )
         } catch (exception: RuntimeException) {
             BluetoothCheckResult(
                 state = SpeakerConnectionState.ERROR,
-                deviceName = safeName(targetDevice),
+                deviceName = targetName,
                 message = exception.message ?: "Bluetooth state check failed",
             )
         }

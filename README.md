@@ -137,6 +137,12 @@ The Accessibility Service also watches live windows for a Bluetooth pairing prom
 
 Explicit **Repair Pair Now** sessions use the same target-name and Wi-Fi/ADB guards, and may accept the target prompt as part of that user-started repair flow.
 
+### Startup details and connection-state recovery (v0.17)
+
+Some Settings previews omit Connect until the saved-speaker row is opened. After focusing a disconnected target and waiting for its preview, the service can open that exact row once per session. It requires one focused, visible, enabled, clickable row in the left pane, containing only the target identity and a disconnected status. Containers containing other devices or actions are rejected. Opening details remains navigation; the service must still find a verified Connect action and confirm the target through A2DP.
+
+Target state checks now consult connected A2DP devices before the bonded-device list. A missing bond record cannot override a confirmed connection to the configured address. If only a name is configured, one exact match is required. The live monitor reconciles a manually established connection and clears stale errors/backoff without leaving user-owned Settings or interrupting an active automation session.
+
 ## Safety Controls
 
 - **Auto Connect On/Off** gates automatic attempts.
